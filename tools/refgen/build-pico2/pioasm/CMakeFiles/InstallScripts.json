@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

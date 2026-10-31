@@ -1,0 +1,2 @@
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/edit_cache.dir
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/rebuild_cache.dir

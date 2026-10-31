@@ -1,0 +1,21 @@
+# ninja log v7
+1	15	1793285726468207882	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-mkdir	beb4f48624089879
+1	15	1793285726468207882	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-mkdir	beb4f48624089879
+16	3456	1793285729908648654	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-download	fa153bbc1328c408
+16	3456	1793285729908648654	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-download	fa153bbc1328c408
+3456	3480	1793285729909438363	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-update	b480eb1f4c3ebbf3
+3456	3480	1793285729909438363	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-update	b480eb1f4c3ebbf3
+3480	3494	1793285729946346314	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-patch	686f2ea8e02075ce
+3480	3494	1793285729946346314	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-patch	686f2ea8e02075ce
+3494	3508	1793285729960806270	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-configure	b3ccf8c32a3ed348
+3494	3508	1793285729960806270	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-configure	b3ccf8c32a3ed348
+3508	3522	1793285729975163225	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-build	afd3b99d33d984fe
+3508	3522	1793285729975163225	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-build	afd3b99d33d984fe
+3523	3536	1793285729989146306	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-install	4e73e92c5379c12f
+3523	3536	1793285729989146306	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-install	4e73e92c5379c12f
+3536	3550	1793285730003024720	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-test	2d45fa71c97226eb
+3536	3550	1793285730003024720	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-test	2d45fa71c97226eb
+3550	3570	1793285730022304925	CMakeFiles/picotool-populate-complete	39ca673d38051689
+3550	3570	1793285730022304925	picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-done	39ca673d38051689
+3550	3570	1793285730022304925	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/CMakeFiles/picotool-populate-complete	39ca673d38051689
+3550	3570	1793285730022304925	/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-done	39ca673d38051689

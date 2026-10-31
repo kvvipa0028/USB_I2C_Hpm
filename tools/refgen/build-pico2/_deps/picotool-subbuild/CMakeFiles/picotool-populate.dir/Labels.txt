@@ -1,0 +1,14 @@
+# Target labels
+ picotool-populate
+# Source files and their labels
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/CMakeFiles/picotool-populate
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/CMakeFiles/picotool-populate.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/CMakeFiles/picotool-populate-complete.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-build.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-configure.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-download.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-install.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-mkdir.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-patch.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-test.rule
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/_deps/picotool-subbuild/picotool-populate-prefix/src/picotool-populate-stamp/picotool-populate-update.rule

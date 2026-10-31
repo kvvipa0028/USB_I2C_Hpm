@@ -1,0 +1,5 @@
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm-install/pioasm/pioasm
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm-install/pioasm/pioasmTargets.cmake
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm-install/pioasm/pioasmTargets-release.cmake
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm-install/pioasm/pioasmConfig.cmake
+/Users/zhaojianzhi/Desktop/macOSandIOS/i2c-analyzer/tools/refgen/build-pico2/pioasm-install/pioasm/pioasmConfigVersion.cmake

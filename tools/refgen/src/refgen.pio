@@ -1,0 +1,7 @@
+; refgen waveform engine
+; segment: bits[31:30]=(SDA,SCL) levels, bits[29:0]=x; lasts x+3 cycles
+.program refgen
+    out x, 30
+    out pins, 2
+loop:
+    jmp x--, loop
