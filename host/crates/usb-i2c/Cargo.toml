@@ -2,6 +2,7 @@
 name = "usb-i2c"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 nusb = "=0.2.8"

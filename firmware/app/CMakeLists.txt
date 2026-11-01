@@ -1,5 +1,5 @@
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 赵建智
+# SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.13)
 
