@@ -1,0 +1,9 @@
+[package]
+name = "usb-i2c-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+eframe = "0.37"
+usb-i2c = { path = "../usb-i2c" }
