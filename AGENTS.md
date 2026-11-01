@@ -1,6 +1,7 @@
 # i2c-analyzer
 
-Commercial USB I2C bus analyzer. Firmware target: HPM6300EVK (HPM6360, RISC-V).
+Commercial USB-to-I2C interface device (hardware I2C, each port master or
+slave). Firmware target: HPM6300EVK (HPM6360, RISC-V).
 
 ## Environment
 
@@ -28,6 +29,11 @@ ninja                     # produces output/demo.elf / demo.bin
 tools/flash.sh firmware/app/build/output/demo.elf
 ```
 
+Reading firmware results without a console: JTAG,
+`openocd ... -c init -c halt -c "mdw <addr> <n>" -c resume -c shutdown`
+(address from `riscv32-unknown-elf-nm demo.elf`). Each command needs its own
+`-c`; commands packed into one `-c` after `halt` do not run.
+
 ## usb_speed firmware (USB throughput test)
 
 ```sh
@@ -37,41 +43,62 @@ cmake -GNinja -DBOARD=hpm6300evk -DHPM_BUILD_TYPE=flash_xip ..
 ninja                     # produces output/demo.elf / demo.bin
 ```
 
-## refgen (Pico I2C signal generator, tools/refgen/)
+## i2c_proto firmware (T1.8 I2C master bring-up)
 
-Environment: `source tools/env.sh` also exports `PICO_SDK_PATH` (~/pico/pico-sdk,
-tag 2.3.1) and prepends the Arm GNU toolchain bin (~/pico/toolchain, gcc 14.3.1).
+Peer: HPM6750EVKMini running the SDK sample `samples/drivers/i2c/interrupt/slave`
+(address 0x16, echoes 128 bytes). Wiring: EVK J28[13]/[15] to EVKMini
+P1[13]/[15], GND to GND.
 
 ```sh
-mkdir -p tools/refgen/build && cd tools/refgen/build
-cmake -GNinja -DPICO_BOARD=pico .. && ninja      # refgen.uf2 (RP2040)
-# or: cmake -GNinja -DPICO_BOARD=pico2 .. && ninja   (RP2350)
+source tools/env.sh
+cmake -S firmware/i2c_proto -B firmware/i2c_proto/build -GNinja -DBOARD=hpm6300evk -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release
+ninja -C firmware/i2c_proto/build
+cmake -S $HPM_SDK_BASE/samples/drivers/i2c/interrupt/slave -B /tmp/i2c_slave_evkmini -GNinja -DBOARD=hpm6750evkmini -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release
+ninja -C /tmp/i2c_slave_evkmini
 ```
 
-Flash: hold BOOTSEL, plug the Pico, drag `refgen.uf2` onto the RPI-RP2 drive.
+Both FT2232 probes report the same serial and both chips the same JTAG ID, so
+select the board by USB location. With the current ports, EVK = `32-2.4` and
+EVKMini = `32-2.1.4`, derived from `/dev/cu.usbserial-202400` and
+`/dev/cu.usbserial-2021400`. Flash the slave first:
 
-Host tests (pattern builder + decoder): `mkdir -p tools/refgen/tests/build &&
-cd tools/refgen/tests/build && cmake -GNinja .. && ninja && ctest`.
+```sh
+cd $HPM_SDK_BASE/boards/openocd
+openocd -c "set HPM_SDK_BASE $HPM_SDK_BASE; set BOARD hpm6750evkmini; set PROBE ft2232;" -f hpm6750_all_in_one.cfg -c "adapter usb location 32-2.1.4" -c "program /tmp/i2c_slave_evkmini/output/demo.elf verify reset exit"
+openocd -c "set HPM_SDK_BASE $HPM_SDK_BASE; set BOARD hpm6300evk; set PROBE ft2232;" -f hpm6300_all_in_one.cfg -c "adapter usb location 32-2.4" -c "program <repo>/firmware/i2c_proto/build/output/demo.elf verify reset" -c "sleep 2000" -c halt -c "mdw <g_result> 5" -c resume -c shutdown
+```
 
-Pins: CH0 SCL=GP2 SDA=GP3; CH1 SCL=GP4 SDA=GP5; SYNC=GP6 (~1 us pulse at each
-pattern loop start, for scope trigger). Push-pull 3.3 V outputs (v1 has no
-open-drain mode). **Pico GND must be tied to the EVK GND.**
+Pass: `c0ffee18 00000000 00000000 00000000 000007d3` (done, write ok, read ok,
+0 mismatches, absent address returns `status_i2c_no_addr_hit` = 2003).
 
-USB CDC commands (line based, `OK ...` / `ERR <reason>`):
-`set <key> <value>` (freq_hz, idle_ns, frames, bytes, nack_every,
-restart_every, addr10_every, glitch_line scl|sda|none, glitch_cycles,
-glitch_every, offset_ns; -1 disables CH1), `build` (prints period_ns, load%,
-segs, min_seg_cycles, res_ns, scl_hz_actual), `start`, `stop`,
-`status`, `dump` (expected events CSV `t_ns,type,addr,rw,data,ack,flags`,
-ends with a note that expected events assume the analyzer filter removes
-glitches).
+## slave_proto / slave_test firmware (T1.9 register-table slave)
 
-Waveform engine: each 32-bit segment = bits[31:30] (SDA,SCL) + bits[29:0]
-hold; refgen.pio does `out x,30` / `out pins,2` / `jmp x--` — 3-cycle fixed
-overhead per segment, min hold 3 cycles, resolution 1 cycle (8 ns @125 MHz,
-6.67 ns @150 MHz). Two SMs run the same buffer (DMA data+control channel
-loop each); CH1 = CH0 delayed by `offset_ns` via one pre-pushed idle segment
-and `pio_enable_sm_mask_in_sync`. CPU idle while running.
+EVK runs `firmware/slave_proto` (I2C0 slave at 0x50, 256-byte EEPROM-style
+table, `g_table`); EVKMini runs `tools/slave_test` (external master, 200 rounds
+at 100 kHz, compares every read with its model `g_exp`). Same wiring as i2c_proto.
+
+```sh
+cmake -S firmware/slave_proto -B firmware/slave_proto/build -GNinja -DBOARD=hpm6300evk -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release && ninja -C firmware/slave_proto/build
+cmake -S tools/slave_test -B tools/slave_test/build -GNinja -DBOARD=hpm6750evkmini -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release && ninja -C tools/slave_test/build
+```
+
+Bus speed: `SLV_MODE` (slave_proto) and `BUS_MODE` (slave_test) must match
+(`i2c_mode_normal` = 100k, `i2c_mode_fast` = 400k). `PEER_PULLUP=1` also turns
+on the EVKMini's internal pull-ups.
+
+Flash the EVK (slave) first, then the EVKMini, with the openocd lines from the
+i2c_proto section; read `g_result` (9 words) on the EVKMini after ~25 s. Pass:
+magic `c0ffee19`, rounds `c8`, then four zeros (call_fail, mismatches,
+first_info, first_val), and `g_table` on the EVK equals `g_exp`. The last three
+words are mode, elapsed_us, peer_pullup. Test record: `docs/T1.9-slave-test.md`,
+raw openocd output in `docs/T1.9-data/`. `SEQ_ONLY=1` in slave_test instead
+writes 0..254 at offset 0 once (quick receive check). Symbol addresses change
+between builds; take them from `riscv32-unknown-elf-nm`.
+
+Enabling the BYTERECV interrupt turns hardware auto-ACK off (INTEN register
+doc), so the slave must ACK each received byte with `i2c_respond_ack()`;
+without it the slave holds SCL low after the first data byte. The SDK helper
+`i2c_enable_auto_ack()` just sets BYTERECV, so it turns hardware auto-ACK off.
 
 ## Host tool (Rust)
 
@@ -86,26 +113,9 @@ cargo clippy -- -D warnings
 cargo check --target x86_64-pc-windows-msvc   # Windows backend compile check
 ```
 
-## Decoder library host tests
-
-```sh
-mkdir -p firmware/lib/i2c_decoder/build && cd firmware/lib/i2c_decoder/build
-cmake -GNinja .. && ninja
-ctest --output-on-failure   # 20 cases, ASan+UBSan
-./test_i2c_decoder <name>   # run one case (see tests/ for names)
-```
-
-Portability check (must stay warning-free):
-
-```sh
-riscv32-unknown-elf-gcc -march=rv32imac -mabi=ilp32 -Os -std=c99 \
-    -Wall -Wextra -Werror -I firmware/lib/i2c_decoder/include \
-    -c firmware/lib/i2c_decoder/src/i2c_decoder.c -o /tmp/i2c_decoder.o
-```
-
 ## Rules
 
 - Planning docs (`PRD.md`, `DEV_PLAN.md`, `功能清单_UTA0301对标.xlsx`) are
   edited only on explicit request.
-- `firmware/lib/i2c_decoder/`: pure C99, no malloc, no global state, no HPM SDK
-  deps. Keep per-edge cost low (target ~3M edges/s/channel on HPM6360).
+- HPM SDK builds `-O0` unless `-DCMAKE_BUILD_TYPE=release` is passed to cmake
+  (measured ~3.5x slower on CPU-bound code). Pass it whenever performance matters.

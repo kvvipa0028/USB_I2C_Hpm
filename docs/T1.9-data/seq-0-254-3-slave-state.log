@@ -1,0 +1,34 @@
+Open On-Chip Debugger 0.12.0+dev (2026-06-30-01:42)
+Licensed under GNU GPL v2
+For bug reports, read
+	http://openocd.org/doc/doxygen/bugs.html
+ft2232
+DEPRECATED! use 'ftdi vid_pid' not 'ftdi_vid_pid'
+DEPRECATED! use 'ftdi layout_init' not 'ftdi_layout_init'
+DEPRECATED! use 'ftdi layout_signal' not 'ftdi_layout_signal'
+DEPRECATED! use 'ftdi layout_signal' not 'ftdi_layout_signal'
+Warn : DEPRECATED: auto-selecting transport "jtag". Use 'transport select jtag' to suppress this message.
+adapter usb location: 32-2.4
+Warn : libusb_detach_kernel_driver() failed with LIBUSB_ERROR_ACCESS, trying to continue anyway
+Info : ftdi: if you experience problems at higher adapter clocks, try the command "ftdi tdo_sample_edge falling"
+Info : clock speed 10000 kHz
+Info : JTAG tap: hpm6360.cpu tap/device found: 0x1000563d (mfg: 0x31e (Andes Technology Corporation), part: 0x0005, ver: 0x1)
+Info : [hpm6360.cpu0] datacount=4 progbufsize=8
+Info : [hpm6360.cpu0] Examined RISC-V core
+Info : [hpm6360.cpu0]  XLEN=32, misa=0x4094112d
+[hpm6360.cpu0] Target successfully examined.
+Info : [hpm6360.cpu0] Examination succeed
+Info : [hpm6360.cpu0] starting gdb server on 3333
+Info : Listening on port 3333 for gdb connections
+hpm6360.cpu0 halted due to debug-request.
+0x010802c8: 51a7e001 00000001 00000001 00000000 
+0x010801c8: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 
+0x010801e8: 20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f 30 31 32 33 34 35 36 37 38 39 3a 3b 3c 3d 3e 3f 
+0x01080208: 40 41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 51 52 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 
+0x01080228: 60 61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a 7b 7c 7d 7e 7f 
+0x01080248: 80 81 82 83 84 85 86 87 88 89 8a 8b 8c 8d 8e 8f 90 91 92 93 94 95 96 97 98 99 9a 9b 9c 9d 9e 9f 
+0x01080268: a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf 
+0x01080288: c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7 d8 d9 da db dc dd de df 
+0x010802a8: e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 ea eb ec ed ee ef f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 fa fb fc fd fe 00 
+0xf3020010: 00000001 00000308 00006461 00000050 
+shutdown command invoked

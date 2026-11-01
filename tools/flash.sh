@@ -4,6 +4,8 @@
 set -euo pipefail
 
 ELF="${1:?usage: $0 <firmware.elf>}"
+[[ -f "$ELF" ]] || { echo "no such file: $ELF" >&2; exit 1; }
+ELF="$(cd "$(dirname "$ELF")" && pwd)/$(basename "$ELF")"   # absolute: we cd below
 : "${HPM_SDK_BASE:?HPM_SDK_BASE not set; run: source tools/env.sh}"
 
 OPENOCD_DIR="${HPM_SDK_BASE}/boards/openocd"

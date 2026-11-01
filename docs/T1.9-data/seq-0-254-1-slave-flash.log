@@ -1,0 +1,53 @@
+Open On-Chip Debugger 0.12.0+dev (2026-06-30-01:42)
+Licensed under GNU GPL v2
+For bug reports, read
+	http://openocd.org/doc/doxygen/bugs.html
+ft2232
+DEPRECATED! use 'ftdi vid_pid' not 'ftdi_vid_pid'
+DEPRECATED! use 'ftdi layout_init' not 'ftdi_layout_init'
+DEPRECATED! use 'ftdi layout_signal' not 'ftdi_layout_signal'
+DEPRECATED! use 'ftdi layout_signal' not 'ftdi_layout_signal'
+Warn : DEPRECATED: auto-selecting transport "jtag". Use 'transport select jtag' to suppress this message.
+adapter usb location: 32-2.4
+Warn : libusb_detach_kernel_driver() failed with LIBUSB_ERROR_ACCESS, trying to continue anyway
+Info : ftdi: if you experience problems at higher adapter clocks, try the command "ftdi tdo_sample_edge falling"
+Info : clock speed 10000 kHz
+Info : JTAG tap: hpm6360.cpu tap/device found: 0x1000563d (mfg: 0x31e (Andes Technology Corporation), part: 0x0005, ver: 0x1)
+Info : [hpm6360.cpu0] datacount=4 progbufsize=8
+Info : [hpm6360.cpu0] Examined RISC-V core
+Info : [hpm6360.cpu0]  XLEN=32, misa=0x4094112d
+[hpm6360.cpu0] Target successfully examined.
+Info : [hpm6360.cpu0] Examination succeed
+Info : [hpm6360.cpu0] starting gdb server on 3333
+Info : Listening on port 3333 for gdb connections
+Info : JTAG tap: hpm6360.cpu tap/device found: 0x1000563d (mfg: 0x31e (Andes Technology Corporation), part: 0x0005, ver: 0x1)
+Info : [hpm6360.cpu0] Hart unexpectedly reset!
+hpm6360.cpu0 halted due to debug-request.
+clocks has been enabled!
+SDRAM has been initialized
+** Programming Started **
+Info : Flash write discontinued at 0x80001090, next section at 0x80003000
+Warn : Adding extra erase range, 0x80000000 .. 0x800003ff
+Warn : Adding extra erase range, 0x80001090 .. 0x80001fff
+Warn : Adding extra erase range, 0x8000dc80 .. 0x8000dfff
+** Programming Finished **
+** Verify Started **
+** Verified OK **
+** Resetting Target **
+Info : JTAG tap: hpm6360.cpu tap/device found: 0x1000563d (mfg: 0x31e (Andes Technology Corporation), part: 0x0005, ver: 0x1)
+Info : [hpm6360.cpu0] Register fp is dirty!
+Info : [hpm6360.cpu0] Register s1 is dirty!
+Info : [hpm6360.cpu0] Register a0 is dirty!
+Info : [hpm6360.cpu0] Register a1 is dirty!
+Info : [hpm6360.cpu0] Discarding values of dirty registers.
+hpm6360.cpu0 halted due to debug-request.
+0x010802c8: 51a7e001 00000000 00000000 00000000 
+0x010801c8: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x010801e8: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x01080208: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x01080228: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x01080248: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x01080268: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x01080288: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x010802a8: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+shutdown command invoked

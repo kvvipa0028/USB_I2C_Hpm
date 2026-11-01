@@ -1,5 +1,5 @@
 /*
- * Minimal bring-up app for the I2C bus analyzer firmware on HPM6300EVK.
+ * Minimal bring-up app for the USB-to-I2C interface firmware on HPM6300EVK.
  * Prints a banner on the console UART and blinks the on-board LED.
  */
 

@@ -21,11 +21,3 @@ esac
 # binaries were re-pointed with install_name_tool from /usr/local/opt/... to
 # x86_64 Homebrew dylibs in ~/hpm/libdeps/lib (that dir must not be moved or
 # deleted). No extra env vars are needed for the compiler itself.
-
-# Raspberry Pi Pico (refgen) toolchain
-export PICO_SDK_PATH="${PICO_SDK_PATH:-$HOME/pico/pico-sdk}"
-PICO_TC_BIN="${PICO_TC_BIN:-$HOME/pico/toolchain/arm-gnu-toolchain-14.3.rel1-darwin-arm64-arm-none-eabi/bin}"
-case ":$PATH:" in
-    *":$PICO_TC_BIN:"*) ;;
-    *) export PATH="$PICO_TC_BIN:$PATH" ;;
-esac
