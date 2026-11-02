@@ -25,7 +25,9 @@ pub struct Slave {
     /// High nibble typed into the cursor cell, waiting for the low one.
     nibble: Option<u8>,
     value: String,
-    value_err: bool,
+    /// The cell whose 应用 failed; cleared when the cursor leaves it or the
+    /// input changes.
+    value_err: Option<usize>,
 }
 
 impl Default for Slave {
@@ -37,7 +39,7 @@ impl Default for Slave {
             cursor: 0,
             nibble: None,
             value: String::new(),
-            value_err: false,
+            value_err: None,
         }
     }
 }
@@ -65,6 +67,12 @@ impl Slave {
                 self.cursor = (self.cursor + 1).min(SIZE - 1);
             }
         }
+    }
+
+    /// Replace the whole table; a half-typed byte is dropped.
+    fn fill(&mut self, table: [u8; SIZE]) {
+        self.table = table;
+        self.nibble = None;
     }
 
     fn as_text(&self) -> String {
@@ -171,16 +179,16 @@ fn table(ui: &mut egui::Ui, s: &mut Slave) {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if widgets::quiet_button(ui, true, "全部 00").clicked() {
-                    s.table = [0; SIZE];
+                    s.fill([0; SIZE]);
                 }
                 if widgets::quiet_button(ui, true, "全部 FF").clicked() {
-                    s.table = [0xff; SIZE];
+                    s.fill([0xff; SIZE]);
                 }
                 if widgets::quiet_button(ui, true, "递增 00–FF").clicked() {
-                    s.table = std::array::from_fn(|i| i as u8);
+                    s.fill(std::array::from_fn(|i| i as u8));
                 }
                 if widgets::quiet_button(ui, edited > 0, "还原").clicked() {
-                    s.table = s.base;
+                    s.fill(s.base);
                 }
                 if widgets::quiet_button(ui, true, "复制 HEX").clicked() {
                     ui.ctx().copy_text(s.as_text());
@@ -377,6 +385,9 @@ fn inspector(ui: &mut egui::Ui, s: &mut Slave) {
     let t = theme::of(ui);
     let i = s.cursor;
     let v = s.table[i];
+    if s.value_err != Some(i) {
+        s.value_err = None;
+    }
     let key = |ui: &mut egui::Ui, k: &str| {
         ui.label(egui::RichText::new(k).size(11.5).color(t.muted));
     };
@@ -413,17 +424,21 @@ fn inspector(ui: &mut egui::Ui, s: &mut Slave) {
                 .char_limit(4)
                 .desired_width(44.0),
         );
+        if r.changed() {
+            s.value_err = None;
+        }
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if widgets::action_button(ui, true, "应用").clicked() || enter {
             match parse_bytes(&s.value).ok().filter(|b| b.len() == 1) {
                 Some(b) => {
                     s.table[i] = b[0];
-                    s.value_err = false;
+                    s.nibble = None;
+                    s.value_err = None;
                 }
-                None => s.value_err = true,
+                None => s.value_err = Some(i),
             }
         }
-        if s.value_err {
+        if s.value_err.is_some() {
             ui.label(
                 egui::RichText::new("填一个字节，如 3C")
                     .size(11.5)
@@ -463,5 +478,14 @@ mod tests {
         assert_eq!(s.as_text().lines().count(), 16);
         assert_eq!(printable(b'<'), Some('<'));
         assert_eq!(printable(0x7f), None);
+    }
+
+    #[test]
+    fn fill_drops_half_typed_byte() {
+        let mut s = Slave::default();
+        s.type_digit(0xa);
+        s.fill([0xff; SIZE]);
+        s.type_digit(0x1);
+        assert_eq!((s.table[0], s.nibble), (0xff, Some(0x1)));
     }
 }

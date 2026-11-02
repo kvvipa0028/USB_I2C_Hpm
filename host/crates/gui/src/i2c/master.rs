@@ -474,6 +474,16 @@ mod tests {
         }
         assert_eq!(m.log.len(), LOG_MAX);
         assert_eq!(m.shown().unwrap().id, (LOG_MAX + 5) as u64);
+        // an old pick never falls off the end: each new record takes the card
+        m.selected = Some(m.log.back().unwrap().id);
+        let t = Transfer {
+            op: Op::Read,
+            addr: 0x50,
+            wdata: Vec::new(),
+            rlen: 1,
+        };
+        m.record(Duration::ZERO, t, Ok(vec![0]));
+        assert_eq!(m.shown().unwrap().id, (LOG_MAX + 6) as u64);
         assert_eq!(clock(Duration::from_millis(61_234)), "01:01.234");
         assert_eq!(preview(&[0; 13]).matches("00").count(), 12);
     }

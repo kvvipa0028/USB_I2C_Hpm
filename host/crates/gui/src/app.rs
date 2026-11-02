@@ -57,15 +57,8 @@ impl App {
     }
 
     fn link(&self) -> Link {
-        if self.connecting.is_some() {
-            Link::Connecting
-        } else if self.dev.conn.is_some() {
-            Link::On
-        } else if self.connect_failed {
-            Link::Failed
-        } else {
-            Link::Off
-        }
+        self.dev
+            .link(self.connecting.is_some(), self.connect_failed)
     }
 
     fn fail(&mut self, msg: String) {
@@ -75,19 +68,26 @@ impl App {
 
     fn start(&mut self, job: Job) {
         self.busy = true;
-        self.tone = Tone::Neutral;
-        self.status = match &job {
-            Job::Refresh => "正在刷新设备列表…".into(),
-            Job::Connect(serial) => format!("正在连接 {serial}…"),
-            Job::Disconnect => "正在断开…".into(),
-            Job::Transfer(t) => format!("正在{} 0x{:02x}…", t.op.label(), t.addr),
-        };
+        // a refresh while connected leaves the last result in the footer
+        if !(matches!(job, Job::Refresh) && self.dev.can_send()) {
+            self.tone = Tone::Neutral;
+            self.status = match &job {
+                Job::Refresh => "正在刷新设备列表…".into(),
+                Job::Connect(serial) => format!("正在连接 {serial}…"),
+                Job::Disconnect => "正在断开…".into(),
+                Job::Transfer(t) => format!("正在{} 0x{:02x}…", t.op.label(), t.addr),
+            };
+        }
+        // the open device, if any, stays until the worker has a new one
         if let Job::Connect(serial) = &job {
-            self.dev.conn = None;
             self.connect_failed = false;
             self.connecting = Some(serial.clone());
         }
-        let _ = self.jobs.send(job);
+        if self.jobs.send(job).is_err() {
+            self.busy = false;
+            self.connecting = None;
+            self.fail("USB worker 已关闭，需重开窗口".into());
+        }
     }
 
     fn act(&mut self, action: Action) {
@@ -102,7 +102,7 @@ impl App {
     }
 
     fn start_transfer(&mut self, op: Op) {
-        if self.busy || self.dev.conn.is_none() {
+        if self.busy || !self.dev.can_send() {
             return;
         }
         match self.i2c.master.transfer(op) {
@@ -115,15 +115,25 @@ impl App {
         self.busy = false;
         match ev {
             Event::Devices(Ok(devs)) => {
+                // `start` left the footer alone only if it was listed before
+                let was_listed = self.dev.can_send();
                 self.dev.set_list(devs);
-                self.tone = Tone::Neutral;
-                self.status = if self.dev.conn.is_some() {
-                    "已连接".into()
-                } else if self.dev.list.is_empty() {
-                    "未找到设备".into()
+                self.connect_failed = false;
+                if self.dev.can_send() {
+                    if !was_listed {
+                        self.tone = Tone::Neutral;
+                        self.status = "已连接".into();
+                    }
+                } else if self.dev.can_disconnect() {
+                    self.fail("设备不在列表，先点断开".into());
                 } else {
-                    "选择设备后点连接".into()
-                };
+                    self.tone = Tone::Neutral;
+                    self.status = if self.dev.list.is_empty() {
+                        "未找到设备".into()
+                    } else {
+                        "选择设备后点连接".into()
+                    };
+                }
             }
             Event::Devices(Err(e)) => self.fail(e),
             Event::Connected(result) => {
@@ -135,8 +145,8 @@ impl App {
                         self.status = "已连接".into();
                     }
                     Err(e) => {
-                        self.dev.conn = None;
-                        self.connect_failed = true;
+                        // the worker kept the device that was open, if any
+                        self.connect_failed = self.dev.conn.is_none();
                         self.fail(e);
                     }
                 }
@@ -185,9 +195,9 @@ impl eframe::App for App {
             self.act(a);
         }
 
-        let link_text = match &self.dev.conn {
-            Some(c) => format!("已连接 {}", c.serial),
-            None => link.text().to_owned(),
+        let link_text = match (&self.dev.conn, link) {
+            (Some(c), Link::On | Link::Missing) => format!("{} {}", link.text(), c.serial),
+            _ => link.text().to_owned(),
         };
         egui::Panel::bottom("status_bar")
             .exact_size(28.0)
@@ -215,7 +225,7 @@ impl eframe::App for App {
             });
 
         let cx = i2c::Ctx {
-            connected: self.dev.conn.is_some(),
+            connected: self.dev.can_send(),
             busy: self.busy,
         };
         let request = egui::CentralPanel::default()

@@ -37,6 +37,8 @@
 - worker 保留 `Job` / `Event` 模式；新增 `Job::Disconnect` 只在本机释放 USB 接口，不向设备发东西。
 - **行为修正**：原来「读取」会把写入框的数据一起发出，有数据时实际变成写后读。现在「读取」与 CLI 的 `read` 一致，只读，不看写入框。
 - 状态文案细化（「正在连接 xxx…」「已断开」等）；传输成功/失败文案沿用原来的。
+- 已打开的设备不在刷新结果里时：顶栏字段仍显示该序列号并标「不在列表」，圆点变红，「断开」一直可点，主机读写按钮禁用（`Devices::can_disconnect` / `can_send`）。
+- 改连另一台设备失败时保留原来打开的设备，新接口 PING 成功后才替换。
 
 ## 中文字体
 
@@ -47,7 +49,7 @@
 
 ## 验证
 
-- `cargo check -p usb-i2c-gui`、`cargo test -p usb-i2c-gui`（10 个测试）、`cargo clippy -p usb-i2c-gui --all-targets -- -D warnings`、`cargo fmt --check` 全部通过。
+- `cargo check -p usb-i2c-gui`、`cargo test -p usb-i2c-gui`（13 个测试）、`cargo clippy -p usb-i2c-gui --all-targets -- -D warnings`、`cargo fmt --check` 全部通过。
 - egui 0.37 需要 Rust ≥ 1.95；系统自带的 cargo 1.85 会在依赖解析阶段失败，要用 rustup 的 stable。
 - 在 Linux（Xvfb，wgpu GL 后端）跑过窗口：深/浅色，设备页、主机页、从机页，900 px 窄窗口，网格键入，设备弹出菜单，以及注入假数据后的结果卡和事务表。
 - **没有接真机测试**：连接、PING、读写走的是原来的 `Bridge` 代码，改动只在 UI 侧，但还需要在 HPM6300EVK 上过一遍。

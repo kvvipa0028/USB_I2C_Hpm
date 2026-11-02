@@ -73,10 +73,8 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                         bridge = Some(b);
                         Event::Connected(Ok(line))
                     }
-                    Err(e) => {
-                        bridge = None;
-                        Event::Connected(Err(e.to_string()))
-                    }
+                    // the device that was open, if any, stays open
+                    Err(e) => Event::Connected(Err(e.to_string())),
                 }
             }
             Job::Disconnect => {
