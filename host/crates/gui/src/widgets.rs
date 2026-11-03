@@ -1,0 +1,571 @@
+//! Shared controls. Magpie rules: no native select (pop-up fields instead),
+//! state as a dot or a soft badge (never a coloured stripe), ink for the main
+//! button, the accent only on what acts (focus, open pop-up, selected cell).
+
+use eframe::egui;
+
+use crate::theme::{self, Tokens};
+
+/// Content is at most this wide and centred, as Magpie's pages.
+pub const PAGE_MAX_W: f32 = 1200.0;
+const FIELD_LABEL_W: f32 = 76.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Green,
+    Red,
+    Amber,
+}
+
+impl Tone {
+    /// (text, soft background)
+    pub fn colors(self, t: &Tokens) -> (egui::Color32, egui::Color32) {
+        match self {
+            Tone::Neutral => (t.fg2, t.pill),
+            Tone::Green => (t.green, t.green_soft),
+            Tone::Red => (t.red, t.red_soft),
+            Tone::Amber => (t.amber, t.amber_soft),
+        }
+    }
+
+    pub fn dot(self, t: &Tokens) -> egui::Color32 {
+        match self {
+            Tone::Neutral => t.faint,
+            other => other.colors(t).0,
+        }
+    }
+}
+
+/// Lay `body` out at most [`PAGE_MAX_W`] wide, centred.
+pub fn page_width<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let full = ui.available_rect_before_wrap();
+    let rect = if full.width() > PAGE_MAX_W {
+        let x = full.center().x - PAGE_MAX_W / 2.0;
+        egui::Rect::from_x_y_ranges(x..=x + PAGE_MAX_W, full.y_range())
+    } else {
+        full
+    };
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), body)
+        .inner
+}
+
+/// Page title, a badge after it, one grey line under it, controls on the right.
+pub fn page_head(
+    ui: &mut egui::Ui,
+    title: &str,
+    badge: Option<(&str, Tone)>,
+    subtitle: &str,
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).size(16.0).strong());
+                if let Some((text, tone)) = badge {
+                    self::badge(ui, text, tone);
+                }
+            });
+            ui.label(
+                egui::RichText::new(subtitle)
+                    .size(12.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+        trailing(ui, 40.0, right);
+    });
+    ui.add_space(4.0);
+}
+
+/// Lay `add` out right to left in a strip `height` tall that fills the rest
+/// of the row. (`with_layout` alone takes all the height below the row.)
+pub fn trailing<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::right_to_left(egui::Align::Center),
+        add,
+    )
+    .inner
+}
+
+/// Small grey group title.
+pub fn group_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(11.0)
+            .color(ui.visuals().weak_text_color())
+            .extra_letter_spacing(0.4),
+    );
+}
+
+fn card_frame(t: &Tokens, margin: i8) -> egui::Frame {
+    egui::Frame::new()
+        .fill(t.card)
+        .stroke(egui::Stroke::new(1.0, t.line))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(margin))
+}
+
+/// Group title above a full-width card.
+pub fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        group_title(ui, title);
+        let t = theme::of(ui);
+        card_frame(&t, 12).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            body(ui);
+        });
+    });
+}
+
+/// BusStudio panel: a card with a head row (title, then `head` on the right),
+/// a hairline, and the body.
+pub fn panel(
+    ui: &mut egui::Ui,
+    title: &str,
+    head: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let t = theme::of(ui);
+    card_frame(&t, 0).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(title).size(13.0).strong());
+                    trailing(ui, 26.0, head);
+                });
+            });
+        divider(ui, t.line);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 8.0;
+                body(ui);
+            });
+    });
+}
+
+fn divider(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+/// Hairline between rows inside a card.
+pub fn hairline(ui: &mut egui::Ui) {
+    let t = theme::of(ui);
+    divider(ui, t.line2);
+}
+
+/// One label/value row of a config card; `last` leaves out the divider.
+pub fn field_row(ui: &mut egui::Ui, label: &str, last: bool, body: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(30.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(FIELD_LABEL_W, 22.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            ui.visuals().weak_text_color(),
+        );
+        body(ui);
+    });
+    if !last {
+        hairline(ui);
+    }
+}
+
+/// A value the firmware fixes: plain text in a soft field, with why on hover.
+pub fn fixed_value(ui: &mut egui::Ui, value: &str, why: &str) -> egui::Response {
+    let t = theme::of(ui);
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(6), t.card2);
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(12.0),
+        t.fg2,
+    );
+    ui.painter().text(
+        rect.right_center() - egui::vec2(8.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        "固定",
+        egui::FontId::proportional(10.5),
+        t.muted,
+    );
+    resp.on_hover_text(why)
+}
+
+/// Status dot, 6 px.
+pub fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.0, color);
+}
+
+/// Soft pill badge.
+pub fn badge(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
+    let t = theme::of(ui);
+    let (fg, bg) = tone.colors(&t);
+    let font = egui::FontId::proportional(11.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
+    let size = egui::vec2(galley.size().x + 16.0, 19.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(99), bg);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp
+}
+
+fn styled_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    fill: [egui::Color32; 2],
+    stroke: egui::Stroke,
+    text: egui::Color32,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(11.0, 4.0);
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = fill[0];
+        w.hovered.weak_bg_fill = fill[1];
+        w.active.weak_bg_fill = fill[1];
+        for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            s.bg_stroke = stroke;
+            s.corner_radius = egui::CornerRadius::same(7);
+        }
+        let text = egui::RichText::new(label).size(12.0).color(text);
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(text).min_size(egui::vec2(0.0, 27.0)),
+        )
+    })
+    .inner
+}
+
+/// The main action of a block: ink fill (fg), not accent.
+pub fn ink_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+    let t = theme::of(ui);
+    styled_button(
+        ui,
+        enabled,
+        label,
+        [t.ink, t.ink_hover],
+        egui::Stroke::NONE,
+        t.ink_fg,
+    )
+}
+
+/// Secondary action: card fill with a hairline edge.
+pub fn action_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+    let t = theme::of(ui);
+    styled_button(
+        ui,
+        enabled,
+        label,
+        [t.card, t.pill],
+        egui::Stroke::new(1.0, t.line),
+        t.fg,
+    )
+}
+
+/// Text button with no fill until hovered.
+pub fn quiet_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+    let t = theme::of(ui);
+    styled_button(
+        ui,
+        enabled,
+        label,
+        [egui::Color32::TRANSPARENT, t.pill],
+        egui::Stroke::NONE,
+        t.ctl,
+    )
+}
+
+/// Magpie pop-up field: grey pill with a faint key, the value, and a chevron.
+/// Open the menu with `egui::Popup::menu(&response)`.
+pub fn popup_field(
+    ui: &mut egui::Ui,
+    key: &str,
+    value: &str,
+    dot: Option<egui::Color32>,
+    width: f32,
+) -> egui::Response {
+    let t = theme::of(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    let radius = egui::CornerRadius::same(6);
+    let fill = if resp.hovered() || open {
+        t.pill_hover
+    } else {
+        t.pill
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, radius, fill);
+    if open {
+        p.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, t.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let mut x = rect.left() + 10.0;
+    if let Some(c) = dot {
+        p.circle_filled(egui::pos2(x + 3.0, rect.center().y), 3.0, c);
+        x += 12.0;
+    }
+    if !key.is_empty() {
+        let r = p.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            key,
+            egui::FontId::proportional(11.5),
+            t.muted,
+        );
+        x = r.right() + 7.0;
+    }
+    let chevron_x = rect.right() - 13.0;
+    let clip = egui::Rect::from_x_y_ranges(x..=chevron_x - 8.0, rect.y_range());
+    p.with_clip_rect(clip).text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(12.5),
+        t.fg,
+    );
+    let c = egui::pos2(chevron_x, rect.center().y);
+    let stroke = egui::Stroke::new(1.3, t.muted);
+    p.line_segment(
+        [c + egui::vec2(-3.5, -1.5), c + egui::vec2(0.0, 2.0)],
+        stroke,
+    );
+    p.line_segment(
+        [c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, -1.5)],
+        stroke,
+    );
+    resp
+}
+
+/// Segmented control without a grey track: the selected item is a card
+/// with a breath of shadow, the rest are quiet text.
+pub fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
+    let t = theme::of(ui);
+    let dark = ui.visuals().dark_mode;
+    // inside a right-to-left layout the row runs backwards; keep the reading order
+    let rtl = ui.layout().prefer_right_to_left();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let order: Vec<&(T, &str)> = if rtl {
+            options.iter().rev().collect()
+        } else {
+            options.iter().collect()
+        };
+        for &&(v, label) in &order {
+            let font = egui::FontId::proportional(12.5);
+            let on = *value == v;
+            let color = if on { t.fg } else { t.ctl };
+            let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+            let size = egui::vec2(galley.size().x + 26.0, 26.0);
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            let radius = egui::CornerRadius::same(6);
+            if on {
+                let shadow = egui::Shadow {
+                    offset: [0, 1],
+                    blur: 3,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(if dark { 70 } else { 24 }),
+                };
+                ui.painter().add(shadow.as_shape(rect, radius));
+                ui.painter().rect_filled(rect, radius, t.card);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, radius, t.pill);
+            }
+            ui.painter()
+                .galley(rect.center() - galley.size() / 2.0, galley, color);
+            if resp.clicked() {
+                *value = v;
+            }
+        }
+    });
+}
+
+/// Fixed-column table drawn with hairlines. Widths of 0 share what is left.
+pub struct Table<'a> {
+    pub widths: &'a [f32],
+}
+
+impl Table<'_> {
+    fn columns(&self, rect: egui::Rect) -> Vec<egui::Rect> {
+        let fixed: f32 = self.widths.iter().sum();
+        let flex = self.widths.iter().filter(|w| **w == 0.0).count().max(1) as f32;
+        let share = ((rect.width() - fixed) / flex).max(40.0);
+        let mut x = rect.left();
+        self.widths
+            .iter()
+            .map(|&w| {
+                let w = if w == 0.0 { share } else { w };
+                let r = egui::Rect::from_x_y_ranges(x..=x + w, rect.y_range());
+                x += w;
+                r
+            })
+            .collect()
+    }
+
+    pub fn header(&self, ui: &mut egui::Ui, names: &[&str]) {
+        let t = theme::of(ui);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), t.card2);
+        for (cell, name) in self.columns(rect).into_iter().zip(names) {
+            ui.painter().text(
+                cell.left_center() + egui::vec2(8.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                *name,
+                egui::FontId::proportional(11.0),
+                t.muted,
+            );
+        }
+    }
+
+    /// One row; each cell is (text, colour, monospace). Returns the row response.
+    pub fn row(
+        &self,
+        ui: &mut egui::Ui,
+        cells: &[(String, egui::Color32, bool)],
+        selected: bool,
+    ) -> egui::Response {
+        let t = theme::of(ui);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        if selected {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(5), t.sel);
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(5), t.card2);
+        }
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, t.line2),
+        );
+        for (cell, (text, color, mono)) in self.columns(rect).into_iter().zip(cells) {
+            let font = if *mono {
+                egui::FontId::monospace(11.5)
+            } else {
+                egui::FontId::proportional(12.0)
+            };
+            ui.painter()
+                .with_clip_rect(cell.shrink2(egui::vec2(4.0, 0.0)))
+                .text(
+                    cell.left_center() + egui::vec2(8.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    font,
+                    *color,
+                );
+        }
+        resp
+    }
+}
+
+/// Footer content. The strip has a fixed height, so a result never pushes
+/// the page up; a result shows as a soft pill.
+pub struct Footer<'a> {
+    pub link: Tone,
+    pub link_text: &'a str,
+    pub busy: bool,
+    pub result: Option<(&'a str, Tone)>,
+    pub right: &'a str,
+}
+
+pub fn footer(ui: &mut egui::Ui, f: &Footer) {
+    let t = theme::of(ui);
+    let small = |s: &str| egui::RichText::new(s).size(11.5).color(t.muted);
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        status_dot(ui, f.link.dot(&t));
+        ui.label(small(f.link_text));
+        ui.add_space(8.0);
+        if f.busy {
+            ui.add(egui::Spinner::new().size(11.0).color(t.muted));
+            ui.label(small("进行中"));
+        } else {
+            ui.label(small("空闲"));
+        }
+        trailing(ui, 20.0, |ui| {
+            ui.label(small(f.right));
+            if let Some((text, tone)) = f.result {
+                ui.add_space(8.0);
+                let shown: String = if text.chars().count() > 72 {
+                    text.chars().take(71).chain(['…']).collect()
+                } else {
+                    text.to_owned()
+                };
+                badge(ui, &shown, tone).on_hover_text(text);
+            }
+        });
+    });
+}
+
+/// Config column on the left and the work area on the right, both working on
+/// `state`; below `stack_below` points of width the two stack.
+pub fn work_columns<S, R>(
+    ui: &mut egui::Ui,
+    state: &mut S,
+    left_w: f32,
+    stack_below: f32,
+    left: impl FnOnce(&mut egui::Ui, &mut S),
+    right: impl FnOnce(&mut egui::Ui, &mut S) -> R,
+) -> R {
+    const GAP: f32 = 14.0;
+    if ui.available_width() < stack_below {
+        left(ui, state);
+        ui.add_space(GAP);
+        return right(ui, state);
+    }
+    ui.horizontal_top(|ui| {
+        let h = ui.available_height();
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_w, h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(left_w);
+                left(ui, state);
+            },
+        );
+        ui.add_space(GAP - ui.spacing().item_spacing.x);
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(w, h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(w);
+                right(ui, state)
+            },
+        )
+        .inner
+    })
+    .inner
+}
