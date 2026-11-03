@@ -1,7 +1,8 @@
 //! I2C workbench: 主机 and 从机 tabs.
 //! 主机 runs on the bridge's one I2C command (write, read, write-then-read).
-//! Scan, bus recovery, and everything on 从机 are laid out but not wired:
-//! the protocol has no commands for them, and nothing here pretends it does.
+//! Scan, bus recovery, and 从机's sync buttons are shown switched off with a
+//! short hover; the protocol has no commands for them. The 从机 table is
+//! edited in the window only.
 
 mod master;
 pub mod parse;
@@ -43,11 +44,11 @@ impl Default for I2c {
     }
 }
 
-/// Firmware facts shown on both tabs.
-const FIXED_PORT: &str = "固件把 I2C0 固定为主机；第二路端口和主从切换要等后续固件。";
-const FIXED_RATE: &str = "速率由固件固定为 100 kHz；调速要等后续固件和协议。";
-/// Why a control is off.
-const NO_CMD: &str = "协议未实现：USB 桥目前只有 PING 和 I2C 读写两个命令。";
+/// Firmware facts, on hover over the fixed fields.
+pub const FIXED_PORT: &str = "当前固件固定为 I2C0 主机";
+pub const FIXED_RATE: &str = "当前固件固定为 100 kHz";
+/// Hover on a control that is switched off.
+pub const NO_CMD: &str = "当前固件无此命令";
 
 /// Returns the transfer the user asked for, if any.
 pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Op> {
@@ -58,7 +59,7 @@ pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Op> {
     };
     let subtitle = match st.tab {
         Tab::Master => "写入、读取、写后读。速率固件固定 100 kHz，单次最多 256 字节。",
-        Tab::Slave => "EEPROM 式寄存器表，256 字节、1 字节偏移。从机命令还没有，表格只在本机编辑。",
+        Tab::Slave => "EEPROM 式寄存器表，256 字节、1 字节偏移，在本窗口编辑。",
     };
     widgets::page_head(ui, "I2C", Some(badge), subtitle, |ui| {
         widgets::seg(

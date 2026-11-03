@@ -32,7 +32,6 @@ impl Page {
 enum Trail {
     None,
     Dot(egui::Color32),
-    Tag(&'static str),
 }
 
 pub const WIDTH: f32 = 212.0;
@@ -52,13 +51,7 @@ pub fn sidebar(ui: &mut egui::Ui, page: &mut Page, link_dot: egui::Color32) {
     ui.add_space(10.0);
     group(ui, "功能");
     for p in Page::FUNCS {
-        // SPI and PWM keep their place in the list; the firmware has no commands for them
-        let trail = if p == Page::I2c {
-            Trail::None
-        } else {
-            Trail::Tag("未实现")
-        };
-        if nav_item(ui, *page == p, p.label(), trail).clicked() {
+        if nav_item(ui, *page == p, p.label(), Trail::None).clicked() {
             *page = p;
         }
     }
@@ -137,15 +130,6 @@ fn nav_item(ui: &mut egui::Ui, selected: bool, label: &str, trail: Trail) -> egu
         Trail::Dot(c) => {
             ui.painter()
                 .circle_filled(rect.right_center() - egui::vec2(14.0, 0.0), 3.0, c);
-        }
-        Trail::Tag(text) => {
-            ui.painter().text(
-                rect.right_center() - egui::vec2(10.0, 0.0),
-                egui::Align2::RIGHT_CENTER,
-                text,
-                egui::FontId::proportional(10.5),
-                t.muted,
-            );
         }
     }
     resp

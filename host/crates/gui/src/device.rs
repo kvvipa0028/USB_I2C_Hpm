@@ -4,6 +4,7 @@
 use eframe::egui;
 use usb_i2c::bridge::DeviceInfo;
 
+use crate::i2c;
 use crate::nav;
 use crate::theme;
 use crate::widgets::{self, Tone};
@@ -271,14 +272,10 @@ pub fn page(
             ui.label(ping.map_or("—", |(p, _)| p));
         });
         widgets::field_row(ui, "端口", false, |ui| {
-            widgets::fixed_value(
-                ui,
-                "I2C0 · 主机",
-                "固件把 I2C0 固定为主机，第二路端口还没有接出。",
-            );
+            widgets::fixed_value(ui, "I2C0 · 主机", i2c::FIXED_PORT);
         });
         widgets::field_row(ui, "速率", false, |ui| {
-            widgets::fixed_value(ui, "100 kHz", "速率由固件固定；调速需要后续固件和协议。");
+            widgets::fixed_value(ui, "100 kHz", i2c::FIXED_RATE);
         });
         widgets::field_row(ui, "单次传输", true, |ui| {
             ui.label("写、读各最多 256 字节");

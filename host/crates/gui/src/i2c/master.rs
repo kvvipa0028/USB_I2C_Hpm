@@ -8,7 +8,9 @@ use std::time::Duration;
 use eframe::egui;
 use usb_i2c::proto::MAX_XFER;
 
-use super::parse::{hex_dump, parse_addr, parse_bytes, parse_len, short_error, to_hex};
+use super::parse::{
+    clock, hex_dump, parse_addr, parse_bytes, parse_len, preview, short_error, to_hex,
+};
 use super::{Ctx, FIXED_PORT, FIXED_RATE, NO_CMD};
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
@@ -124,6 +126,8 @@ impl Master {
 
 pub fn show(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
     widgets::work_columns(ui, m, 264.0, 760.0, config, |ui, m| {
+        summary(ui, m);
+        ui.add_space(12.0);
         let op = compose(ui, m, cx);
         ui.add_space(14.0);
         result(ui, m);
@@ -158,13 +162,7 @@ fn config(ui: &mut egui::Ui, m: &mut Master) {
                 );
             });
             widgets::field_row(ui, "读取长度", true, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut m.read_len)
-                        .hint_text("1-256")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(ui.available_width() - 18.0),
-                );
-                ui.label(egui::RichText::new("B").size(11.0).color(t.muted));
+                widgets::unit_edit(ui, &mut m.read_len, "1-256", "B");
             });
             let errs = [
                 parse_addr(&m.addr)
@@ -179,32 +177,27 @@ fn config(ui: &mut egui::Ui, m: &mut Master) {
             }
         },
     );
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new("地址不含读写位，按 7 位（0x00–0x7F）填写。")
-            .size(11.5)
-            .color(t.muted),
-    );
-    ui.add_space(10.0);
-    widgets::panel(
+    ui.add_space(8.0);
+    widgets::note(ui, "地址不含读写位，按 7 位（0x00–0x7F）填写。");
+}
+
+/// Counts over this session's log.
+fn summary(ui: &mut egui::Ui, m: &Master) {
+    let acked = m.log.iter().filter(|r| r.ok()).count();
+    let read: usize = m
+        .log
+        .iter()
+        .filter_map(|r| r.result.as_ref().ok())
+        .map(Vec::len)
+        .sum();
+    widgets::summary_strip(
         ui,
-        "总线工具",
-        |ui| {
-            widgets::badge(ui, "待协议", Tone::Amber);
-        },
-        |ui| {
-            ui.horizontal(|ui| {
-                widgets::action_button(ui, false, "扫描地址").on_disabled_hover_text(NO_CMD);
-                widgets::action_button(ui, false, "总线恢复").on_disabled_hover_text(NO_CMD);
-            });
-            ui.label(
-                egui::RichText::new(
-                    "地址扫描（0x08–0x77）和总线恢复（9 个时钟 + STOP）需要固件新增 USB 命令，当前版本不提供。",
-                )
-                .size(11.5)
-                .color(t.muted),
-            );
-        },
+        &[
+            ("事务", m.log.len().to_string()),
+            ("应答成功", format!("{acked} / {}", m.log.len())),
+            ("接收字节", format!("{read} B")),
+        ],
+        "本次会话",
     );
 }
 
@@ -346,9 +339,6 @@ fn log(ui: &mut egui::Ui, m: &mut Master) {
         ui,
         "事务记录",
         |ui| {
-            if widgets::quiet_button(ui, count > 0, "清空").clicked() {
-                clear = true;
-            }
             ui.label(
                 egui::RichText::new(format!("{count} 条 · 本次会话"))
                     .size(11.0)
@@ -356,6 +346,21 @@ fn log(ui: &mut egui::Ui, m: &mut Master) {
             );
         },
         |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("I2C0 · 时间 / HEX")
+                        .size(11.5)
+                        .color(t.muted),
+                );
+                widgets::trailing(ui, 27.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if widgets::quiet_button(ui, count > 0, "清空").clicked() {
+                        clear = true;
+                    }
+                    widgets::quiet_button(ui, false, "总线恢复").on_disabled_hover_text(NO_CMD);
+                    widgets::quiet_button(ui, false, "扫描地址").on_disabled_hover_text(NO_CMD);
+                });
+            });
             if m.log.is_empty() {
                 ui.label(egui::RichText::new("暂无记录。").color(t.muted));
                 return;
@@ -403,6 +408,7 @@ fn log(ui: &mut egui::Ui, m: &mut Master) {
                         }
                     }
                 });
+            widgets::table_foot(ui, "最新在上 · 点行查看结果", &format!("最多 {LOG_MAX} 条"));
         },
     );
     if clear {
@@ -412,27 +418,6 @@ fn log(ui: &mut egui::Ui, m: &mut Master) {
     if pick.is_some() {
         m.selected = pick;
     }
-}
-
-/// First bytes as hex, with an ellipsis when there are more.
-fn preview(data: &[u8]) -> String {
-    const N: usize = 12;
-    if data.len() > N {
-        format!("{} …", to_hex(&data[..N]))
-    } else {
-        to_hex(data)
-    }
-}
-
-/// `mm:ss.mmm` since the window opened.
-fn clock(d: Duration) -> String {
-    let ms = d.as_millis();
-    format!(
-        "{:02}:{:02}.{:03}",
-        ms / 60_000,
-        (ms / 1000) % 60,
-        ms % 1000
-    )
 }
 
 #[cfg(test)]
@@ -484,7 +469,5 @@ mod tests {
         };
         m.record(Duration::ZERO, t, Ok(vec![0]));
         assert_eq!(m.shown().unwrap().id, (LOG_MAX + 6) as u64);
-        assert_eq!(clock(Duration::from_millis(61_234)), "01:01.234");
-        assert_eq!(preview(&[0; 13]).matches("00").count(), 12);
     }
 }

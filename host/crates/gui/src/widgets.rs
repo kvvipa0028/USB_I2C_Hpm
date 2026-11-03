@@ -366,6 +366,216 @@ pub fn popup_field(
     resp
 }
 
+/// Pop-up field for one config row: the current option's label, a menu of
+/// the rest. Returns true when the pick changed.
+pub fn pick<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    let label = options.iter().find(|o| o.0 == *value).map_or("", |o| o.1);
+    let width = ui.available_width();
+    let resp = popup_field(ui, "", label, None, width);
+    let before = *value;
+    egui::Popup::menu(&resp).width(width).show(|ui| {
+        ui.set_min_width(width - 12.0);
+        for &(v, label) in options {
+            ui.selectable_value(value, v, label);
+        }
+    });
+    *value != before
+}
+
+/// Single-line monospace field with a faint unit after it.
+pub fn unit_edit(ui: &mut egui::Ui, text: &mut String, hint: &str, unit: &str) -> egui::Response {
+    let t = theme::of(ui);
+    let unit_w = if unit.is_empty() { 0.0 } else { 26.0 };
+    let resp = ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(ui.available_width() - unit_w),
+    );
+    if !unit.is_empty() {
+        ui.label(egui::RichText::new(unit).size(11.0).color(t.muted));
+    }
+    resp
+}
+
+/// 高级参数-style row: a chevron, the title, and how many items it hides.
+/// Click flips `open`; the caller shows the items when it is set.
+pub fn disclosure(ui: &mut egui::Ui, open: &mut bool, title: &str, count: usize) {
+    let t = theme::of(ui);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), t.card2);
+    }
+    let c = rect.left_center() + egui::vec2(8.0, 0.0);
+    let stroke = egui::Stroke::new(1.3, t.muted);
+    let pts = if *open {
+        [
+            egui::vec2(-3.5, -1.5),
+            egui::vec2(0.0, 2.0),
+            egui::vec2(3.5, -1.5),
+        ]
+    } else {
+        [
+            egui::vec2(-1.5, -3.5),
+            egui::vec2(2.0, 0.0),
+            egui::vec2(-1.5, 3.5),
+        ]
+    };
+    ui.painter().line_segment([c + pts[0], c + pts[1]], stroke);
+    ui.painter().line_segment([c + pts[1], c + pts[2]], stroke);
+    let r = ui.painter().text(
+        rect.left_center() + egui::vec2(20.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(12.0),
+        t.fg2,
+    );
+    ui.painter().text(
+        r.right_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        format!("{count} 项"),
+        egui::FontId::proportional(11.5),
+        t.muted,
+    );
+    if resp.clicked() {
+        *open = !*open;
+    }
+}
+
+/// BusStudio summary band: label / value pairs on a soft strip, a faint
+/// note at the right end.
+pub fn summary_strip(ui: &mut egui::Ui, items: &[(&str, String)], note: &str) {
+    let t = theme::of(ui);
+    egui::Frame::new()
+        .fill(t.card2)
+        .stroke(egui::Stroke::new(1.0, t.line2))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(14, 7))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                for (label, value) in items {
+                    ui.label(egui::RichText::new(*label).size(11.5).color(t.muted));
+                    ui.label(egui::RichText::new(value).monospace().color(t.fg));
+                    ui.add_space(10.0);
+                }
+                trailing(ui, 18.0, |ui| {
+                    ui.label(egui::RichText::new(note).size(11.0).color(t.muted));
+                });
+            });
+        });
+}
+
+/// A circled "i" and a short muted note that wraps.
+pub fn note(ui: &mut egui::Ui, text: &str) {
+    let t = theme::of(ui);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 16.0), egui::Sense::hover());
+        let c = rect.center();
+        ui.painter()
+            .circle_stroke(c, 5.5, egui::Stroke::new(1.0, t.muted));
+        ui.painter().line_segment(
+            [c + egui::vec2(0.0, -0.5), c + egui::vec2(0.0, 2.8)],
+            egui::Stroke::new(1.1, t.muted),
+        );
+        ui.painter()
+            .circle_filled(c + egui::vec2(0.0, -2.6), 0.7, t.muted);
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(t.muted)).wrap());
+    });
+}
+
+/// Muted line under a table: what it shows on the left, scope on the right.
+pub fn table_foot(ui: &mut egui::Ui, left: &str, right: &str) {
+    let t = theme::of(ui);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(left).size(11.0).color(t.muted));
+        trailing(ui, 16.0, |ui| {
+            ui.label(egui::RichText::new(right).size(11.0).color(t.muted));
+        });
+    });
+}
+
+/// Horizontal slider in Magpie's look: a thin track, the filled part and the
+/// knob in accent. Snaps to `step`; ← / → move one step while focused.
+pub fn slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+) -> egui::Response {
+    let t = theme::of(ui);
+    let (lo, hi) = (*range.start(), *range.end());
+    let (rect, mut resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 22.0),
+        egui::Sense::click_and_drag(),
+    );
+    let track = rect.shrink2(egui::vec2(8.0, 0.0));
+    let snap = |v: f32| ((v / step).round() * step).clamp(lo, hi);
+    let before = *value;
+    if let Some(p) = resp.interact_pointer_pos() {
+        if resp.dragged() || resp.clicked() {
+            let f = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            *value = snap(lo + f * (hi - lo));
+            resp.request_focus();
+        }
+    }
+    if resp.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (left, right) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        if left {
+            *value = snap(*value - step);
+        }
+        if right {
+            *value = snap(*value + step);
+        }
+    }
+    if *value != before {
+        resp.mark_changed();
+    }
+    let f = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let y = rect.center().y;
+    let knob = egui::pos2(track.left() + f * track.width(), y);
+    let bar = |a: f32, b: f32| egui::Rect::from_x_y_ranges(a..=b, y - 2.0..=y + 2.0);
+    let p = ui.painter();
+    p.rect_filled(
+        bar(track.left(), track.right()),
+        egui::CornerRadius::same(2),
+        t.pill_hover,
+    );
+    p.rect_filled(
+        bar(track.left(), knob.x),
+        egui::CornerRadius::same(2),
+        t.accent,
+    );
+    let r = if resp.hovered() || resp.dragged() {
+        7.5
+    } else {
+        7.0
+    };
+    p.circle_filled(knob, r, t.accent);
+    p.circle_filled(knob, r - 4.5, t.card);
+    if resp.has_focus() {
+        p.circle_stroke(knob, r + 2.5, egui::Stroke::new(1.0, t.accent_soft));
+    }
+    resp
+}
+
 /// Segmented control without a grey track: the selected item is a card
 /// with a breath of shadow, the rest are quiet text.
 pub fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {

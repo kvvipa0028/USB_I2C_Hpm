@@ -1,6 +1,7 @@
 //! The window: top device bar, sidebar, page, and a status footer.
-//! State lives here; pages return what the user asked for and the app turns
-//! it into a worker `Job`.
+//! State lives here; the device and I2C pages return what the user asked
+//! for and the app turns it into a worker `Job`. SPI and PWM keep their
+//! state in their own pages and never reach the worker.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
@@ -10,6 +11,8 @@ use eframe::egui;
 use crate::device::{self, Action, Conn, Devices, Link};
 use crate::i2c::{self, I2c};
 use crate::nav::{self, Page};
+use crate::pwm::{self, Pwm};
+use crate::spi::{self, Spi};
 use crate::theme;
 use crate::widgets::{self, Footer, Tone};
 use crate::worker::{self, Event, Job, Op};
@@ -22,6 +25,8 @@ pub struct App {
     events: Receiver<Event>,
     dev: Devices,
     i2c: I2c,
+    spi: Spi,
+    pwm: Pwm,
     page: Page,
     busy: bool,
     /// Serial being connected to.
@@ -43,6 +48,8 @@ impl App {
             events,
             dev: Devices::default(),
             i2c: I2c::default(),
+            spi: Spi::default(),
+            pwm: Pwm::default(),
             page: Page::Device,
             busy: true,
             connecting: None,
@@ -211,7 +218,11 @@ impl eframe::App for App {
                         link_text: &link_text,
                         busy: self.busy,
                         result: Some((&self.status, self.tone)),
-                        right: "I2C0 · 100 kHz（固件固定）",
+                        right: match self.page {
+                            Page::Device | Page::I2c => "I2C0 · 100 kHz（固件固定）",
+                            Page::Spi => "SPI · 本地会话",
+                            Page::Pwm => "PWM · 配置预览",
+                        },
                     },
                 )
             });
@@ -228,6 +239,7 @@ impl eframe::App for App {
             connected: self.dev.can_send(),
             busy: self.busy,
         };
+        let now = self.opened.elapsed();
         let request = egui::CentralPanel::default()
             .frame(bar(20, 16))
             .show(ui, |ui| {
@@ -241,8 +253,12 @@ impl eframe::App for App {
                     )
                     .map(Request::Device),
                     Page::I2c => i2c::page(ui, &mut self.i2c, cx).map(Request::I2c),
-                    Page::Spi | Page::Pwm => {
-                        placeholder_page(ui, self.page.label());
+                    Page::Spi => {
+                        spi::page(ui, &mut self.spi, now);
+                        None
+                    }
+                    Page::Pwm => {
+                        pwm::page(ui, &mut self.pwm, now);
                         None
                     }
                 })
@@ -259,21 +275,6 @@ impl eframe::App for App {
 enum Request {
     Device(Action),
     I2c(Op),
-}
-
-fn placeholder_page(ui: &mut egui::Ui, name: &str) {
-    widgets::page_head(
-        ui,
-        name,
-        Some(("未实现", Tone::Neutral)),
-        "当前固件只实现了 I2C，这里还没有命令。",
-        |_| {},
-    );
-    widgets::section(ui, "说明", |ui| {
-        ui.label(format!(
-            "{name} 属于第二批功能，需要新的固件和 USB 命令。入口先留在侧栏，固件支持后在这里接入。"
-        ));
-    });
 }
 
 /// Some window managers ignore the initial size; widen the first frame if so.
