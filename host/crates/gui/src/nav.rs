@@ -1,10 +1,12 @@
 //! Sidebar: device connection, then the functions (I2C / SPI / PWM).
 //! As a Mac sidebar: graphite, the current page is a card with a small
-//! shadow, and the label keeps its ink colour (no accent).
+//! shadow, and the label keeps its ink colour (no accent). 外观 and the
+//! version sit at the foot.
 
 use eframe::egui;
 
 use crate::theme;
+use crate::widgets;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -67,7 +69,33 @@ pub fn sidebar(ui: &mut egui::Ui, page: &mut Page, link_dot: egui::Color32) {
                 .size(11.0)
                 .color(ui.visuals().weak_text_color()),
         );
+        ui.add_space(6.0);
+        theme_field(ui);
     });
+}
+
+/// 外观: 浅色, 深色, or 跟随系统, applied and saved on pick.
+fn theme_field(ui: &mut egui::Ui) {
+    let current = ui.ctx().options(|o| o.theme_preference);
+    let label = theme::CHOICES
+        .iter()
+        .find(|c| c.0 == current)
+        .map_or("", |c| c.2);
+    let width = ui.available_width();
+    let resp = widgets::popup_field(ui, "外观", label, None, width);
+    egui::Popup::menu(&resp)
+        .width(width)
+        .align(egui::RectAlign::TOP_START)
+        .show(|ui| {
+            ui.set_min_width(width - 12.0);
+            let mut pick = current;
+            for (pref, _, label) in theme::CHOICES {
+                ui.selectable_value(&mut pick, pref, label);
+            }
+            if pick != current {
+                theme::set(ui.ctx(), pick);
+            }
+        });
 }
 
 fn group(ui: &mut egui::Ui, title: &str) {

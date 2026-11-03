@@ -1,7 +1,10 @@
 //! Colour tokens and egui visuals, after Magpie: one quiet graphite surface,
 //! a single indigo accent (light #4f46e5, dark #a5b4fc) kept for what acts,
 //! ink (fg) for the main button, status as dots and soft badges.
-//! Light and dark follow the system.
+//! Light, dark, or the system's: 外观 at the foot of the sidebar picks one,
+//! and the pick is kept in a one-word file (see [`pref_path`]).
+
+use std::path::PathBuf;
 
 use eframe::egui;
 
@@ -192,5 +195,84 @@ pub fn install(ctx: &egui::Context) {
                 egui::FontId::new(11.5, egui::FontFamily::Monospace),
             );
         });
+    }
+    ctx.set_theme(load());
+}
+
+/// 外观 choices in menu order: preference, word in the saved file, label.
+pub const CHOICES: [(egui::ThemePreference, &str, &str); 3] = [
+    (egui::ThemePreference::Light, "light", "浅色"),
+    (egui::ThemePreference::Dark, "dark", "深色"),
+    (egui::ThemePreference::System, "system", "跟随系统"),
+];
+
+/// A saved word back to its preference; anything else follows the system.
+fn parse(text: &str) -> egui::ThemePreference {
+    CHOICES
+        .iter()
+        .find(|c| c.1 == text.trim())
+        .map_or(egui::ThemePreference::System, |c| c.0)
+}
+
+fn word(pref: egui::ThemePreference) -> &'static str {
+    CHOICES
+        .iter()
+        .find(|c| c.0 == pref)
+        .map_or("system", |c| c.1)
+}
+
+/// `usb-i2c/theme` under `$XDG_CONFIG_HOME` or `~/.config`;
+/// `%APPDATA%\USB-I2C\theme` on Windows;
+/// `~/Library/Application Support/USB-I2C/theme` on macOS.
+fn pref_path() -> Option<PathBuf> {
+    let dir = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("APPDATA")?).join("USB-I2C")
+    } else if cfg!(target_os = "macos") {
+        std::env::home_dir()?.join("Library/Application Support/USB-I2C")
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::home_dir().map(|h| h.join(".config")))?
+            .join("usb-i2c")
+    };
+    Some(dir.join("theme"))
+}
+
+/// The saved preference; 跟随系统 when nothing is saved.
+fn load() -> egui::ThemePreference {
+    pref_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map_or(egui::ThemePreference::System, |s| parse(&s))
+}
+
+/// Apply `pref` now and keep it for the next start.
+pub fn set(ctx: &egui::Context, pref: egui::ThemePreference) {
+    ctx.set_theme(pref);
+    // if the file cannot be written, the pick still holds until the window closes
+    if let Some(path) = pref_path() {
+        let _ = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, word(pref)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preference_round_trips() {
+        for (pref, _, _) in CHOICES {
+            assert_eq!(parse(word(pref)), pref);
+        }
+        assert_eq!(parse("dark\n"), egui::ThemePreference::Dark);
+    }
+
+    #[test]
+    fn unset_or_unknown_follows_system() {
+        assert_eq!(parse(""), egui::ThemePreference::System);
+        assert_eq!(parse("sepia"), egui::ThemePreference::System);
     }
 }

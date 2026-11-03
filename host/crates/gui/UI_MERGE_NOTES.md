@@ -29,7 +29,7 @@
 - 主按钮用墨色（fg），次按钮白底描边，工具按钮无底（Magpie 按钮层级）。状态一律用圆点和软徽章，没有彩色左边条。
 - 从 BusStudio 拿的是结构：顶栏设备条、页脚状态、「配置 | 工作区」两栏、面板头 + 细线、字段行、事务表、EEPROM 网格的观感。没有搬它的横向页签、完整三步向导和演示数据。
 - BusStudio 的 HTML 没有进仓库。
-- Token 补了 Magpie 的 `line2 / fg2 / faint / accent_soft / green(-soft) / red-soft / amber-soft / ink`，深浅色仍跟随系统。
+- Token 补了 Magpie 的 `line2 / fg2 / faint / accent_soft / green(-soft) / red-soft / amber-soft / ink`。深浅色由侧栏底部「外观」选：浅色 / 深色 / 跟随系统（默认）；选择存在一个单词的小文件里（Linux `$XDG_CONFIG_HOME` 或 `~/.config` 下的 `usb-i2c/theme`，Windows `%APPDATA%\USB-I2C\theme`，macOS `~/Library/Application Support/USB-I2C/theme`），重启后保留。
 
 ## 协议与行为
 
@@ -42,7 +42,7 @@
 
 ## 中文字体
 
-- 内置 `assets/fonts/NotoSansSC-UI.otf`：Noto Sans CJK SC Regular 按 `src/` 里实际用到的字（加常用中文标点）裁成子集，约 83 KB / 241 个字符；许可证 SIL OFL 1.1，见同目录 `OFL.txt`。
+- 内置 `assets/fonts/NotoSansSC-UI.otf`：Noto Sans CJK SC Regular 按 `src/` 里实际用到的字（加常用中文标点）裁成子集，约 87 KB / 249 个字符；许可证 SIL OFL 1.1，见同目录 `OFL.txt`。
 - 加中文文案后重跑 `assets/fonts/subset.sh`（需要 fonttools 和 Noto Sans CJK）。测试 `fonts::tests::subset_covers_ui_text` 扫描全部源码，有字不在子集里就失败。
 - 子集排在 egui 自带字体之后，英文和数字仍用 egui 字体。子集外的字（例如 Windows 返回的中文系统错误、用户粘贴的文本）交给 eframe 默认开启的系统字体回退。
 - 缺口：只内置了 Regular 一个字重，没有粗体（egui 的 `strong()` 本来就只加深颜色，中英文一样）；中文 Regular 比 egui 的英文字体 Ubuntu Light 略重。
