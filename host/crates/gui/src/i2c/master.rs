@@ -67,6 +67,8 @@ impl Record {
 #[derive(Clone, PartialEq, Debug)]
 struct Cfg {
     addr: String,
+    /// UI-only preference, not sent to the bridge until its protocol supports it.
+    clock_stretching: bool,
     /// Register address sent before the write bytes; empty for none.
     reg: String,
     reg16: bool,
@@ -78,6 +80,7 @@ impl Default for Cfg {
     fn default() -> Self {
         Self {
             addr: "0x50".into(),
+            clock_stretching: true,
             reg: String::new(),
             reg16: false,
             read_len: "16".into(),
@@ -331,6 +334,11 @@ fn config(ui: &mut egui::Ui, m: &mut Master) {
             widgets::field_row(ui, "速率", false, |ui| {
                 widgets::fixed_value(ui, "100 kHz", FIXED_RATE);
             });
+            widgets::field_row(ui, "时钟延展", false, |ui| {
+                widgets::check(ui, &mut c.clock_stretching, "启用");
+                widgets::badge(ui, "仅设置", Tone::Neutral);
+            });
+            widgets::note(ui, "仅保存本窗口设置，尚未接入固件，不影响实际 I2C 通信。");
             widgets::field_row(ui, "目标地址", false, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut c.addr)
