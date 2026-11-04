@@ -32,6 +32,9 @@ mod uds;
 mod widgets;
 mod worker;
 
+#[cfg(test)]
+mod smoke_tests;
+
 use eframe::egui;
 
 fn main() -> eframe::Result {

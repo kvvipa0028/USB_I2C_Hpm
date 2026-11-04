@@ -1,5 +1,5 @@
 //! Device strip in the top bar and the connection page. Connecting opens the
-//! bridge and sends one PING, whose reply carries the firmware id.
+//! bridge and uses PING, whose reply carries the firmware id.
 
 use eframe::egui;
 use usb_i2c::bridge::DeviceInfo;
@@ -48,10 +48,14 @@ impl Devices {
             .is_some_and(|c| self.list.iter().any(|d| d.serial == c.serial))
     }
 
-    /// What 连接 would open: the selected device, unless it is the open one.
+    /// One bridge at a time. Even reopening the same serial needs an explicit
+    /// disconnect first; a selection never replaces the active connection.
     pub fn connect_target(&self) -> Option<&str> {
-        self.selected_serial()
-            .filter(|s| self.conn.as_ref().is_none_or(|c| c.serial != *s))
+        if self.conn.is_some() {
+            None
+        } else {
+            self.selected_serial()
+        }
     }
 
     pub fn link(&self, connecting: bool, connect_failed: bool) -> Link {
@@ -68,14 +72,19 @@ impl Devices {
         }
     }
 
-    /// The top bar field: the selected device, or the open one once it has
-    /// dropped out of the list.
+    /// Always identify the active bridge while connected, even if another
+    /// row is selected for a later connection.
     fn field_text(&self) -> String {
-        match (&self.conn, self.list.get(self.selected)) {
-            (Some(c), _) if !self.can_send() => format!("{}   不在列表", c.serial),
-            (_, Some(d)) => device_label(d),
-            (_, None) => "未找到设备".to_owned(),
+        if let Some(c) = &self.conn {
+            return self
+                .list
+                .iter()
+                .find(|d| d.serial == c.serial)
+                .map_or_else(|| format!("{}   不在列表", c.serial), device_label);
         }
+        self.list
+            .get(self.selected)
+            .map_or_else(|| "未找到设备".to_owned(), device_label)
     }
 }
 
@@ -156,10 +165,7 @@ pub fn top_bar(ui: &mut egui::Ui, dev: &mut Devices, busy: bool, link: Link) -> 
         }
 
         widgets::trailing(ui, 30.0, |ui| {
-            // once the open device is gone the field shows it, not the
-            // selection, so 连接 lives on the connection page only
-            let target = dev.connect_target().filter(|_| link != Link::Missing);
-            if let Some(a) = connect_buttons(ui, dev, target, busy) {
+            if let Some(a) = connect_buttons(ui, dev, dev.connect_target(), busy) {
                 action = Some(a);
             }
             if widgets::quiet_button(ui, !busy, "刷新").clicked() {
@@ -214,7 +220,7 @@ pub fn page(
         ui,
         "设备连接",
         Some((link.text(), link.tone())),
-        "选择一块 usb_i2c，再点连接。连接时发一次 PING，读回固件版本。",
+        "选择一块 usb_i2c，再点连接。连接时用 PING 读回固件版本。连接其他设备前，先点断开。",
         |ui| {
             if widgets::action_button(ui, !busy, "刷新").clicked() {
                 action = Some(Action::Refresh);
@@ -402,15 +408,30 @@ mod tests {
         assert!(d.can_disconnect());
         assert!(!d.can_send());
         assert_eq!(d.link(false, false), Link::Missing);
-        assert_eq!(d.connect_target(), Some("B"));
+        assert_eq!(d.connect_target(), None);
         assert_eq!(d.field_text(), "A   不在列表");
         // back in the list: sendable again
         d.set_list(vec![dev("B"), dev("A")]);
         assert!(d.can_send());
-        assert_eq!(d.field_text(), "B   USB High");
+        assert_eq!(d.field_text(), "A   USB High");
         d.conn = None;
         assert!(!d.can_disconnect() && !d.can_send());
         assert_eq!(d.link(false, true), Link::Failed);
+        assert_eq!(d.connect_target(), Some("B"));
+    }
+
+    #[test]
+    fn selecting_another_device_does_not_offer_replacement() {
+        let mut d = open_a();
+        d.set_list(vec![dev("A"), dev("B")]);
+        d.selected = 1;
+        assert_eq!(d.selected_serial(), Some("B"));
+        assert_eq!(d.connect_target(), None);
+        assert_eq!(d.field_text(), "A   USB High");
+        assert!(d.can_send());
+        d.conn = None;
+        assert_eq!(d.connect_target(), Some("B"));
+        assert_eq!(d.field_text(), "B   USB High");
     }
 
     #[test]
