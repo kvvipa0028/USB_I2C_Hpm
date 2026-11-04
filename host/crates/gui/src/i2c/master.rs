@@ -183,9 +183,8 @@ impl Master {
         t: Transfer,
         result: Result<Vec<u8>, String>,
     ) -> &Record {
-        if result.is_err() && self.loop_op.take().is_some() {
-            self.looping = false;
-            self.loop_note = Some("传输失败，循环已停止".into());
+        if result.is_err() {
+            self.stop_loop("传输失败，循环已停止");
         }
         self.push(Record {
             id: 0,
@@ -244,6 +243,17 @@ impl Master {
         self.loop_op.is_some()
     }
 
+    /// Disarm both the scheduled transfer and the switch at the boundary that
+    /// ends a connection or reports an error, without waiting for another frame.
+    pub fn stop_loop(&mut self, reason: &str) {
+        let was_enabled = self.looping || self.loop_op.is_some();
+        self.looping = false;
+        self.loop_op = None;
+        if was_enabled {
+            self.loop_note = Some(reason.to_owned());
+        }
+    }
+
     /// The transfer to send again, when 循环 is on and its period has come.
     /// Disconnecting or a field turning bad stops the loop.
     pub fn loop_due(&mut self, now: Duration, connected: bool, busy: bool) -> Option<Op> {
@@ -257,9 +267,7 @@ impl Master {
                 .map(|e| format!("{e}，循环已停止"))
         };
         if let Some(why) = stop {
-            self.loop_op = None;
-            self.looping = false;
-            self.loop_note = Some(why);
+            self.stop_loop(&why);
             return None;
         }
         if busy || now < next {
@@ -278,6 +286,14 @@ impl Master {
     /// Records that went over USB.
     fn real(&self) -> impl Iterator<Item = &Record> {
         self.log.iter().filter(|r| r.demo.is_none())
+    }
+
+    /// Shared fixture for App's queue-only connection lifecycle tests.
+    #[cfg(test)]
+    pub(crate) fn arm_test_write_loop(&mut self) {
+        self.write_hex = "00 AA".into();
+        self.looping = true;
+        self.loop_op = Some((Op::Write, Duration::ZERO));
     }
 }
 
@@ -810,5 +826,29 @@ mod tests {
         m.loop_op = Some((Op::Read, ms(0)));
         assert_eq!(m.loop_due(ms(300), false, false), None);
         assert!(m.loop_note.as_deref().unwrap().contains("断开"));
+    }
+
+    #[test]
+    fn stop_loop_disarms_switch_even_before_first_transfer() {
+        let mut m = Master {
+            looping: true,
+            ..Master::default()
+        };
+        m.stop_loop("设备已断开，循环已停止");
+        assert!(!m.looping && !m.looping());
+        assert_eq!(m.loop_note.as_deref(), Some("设备已断开，循环已停止"));
+        assert_eq!(m.loop_due(Duration::from_secs(1), true, false), None);
+    }
+
+    #[test]
+    fn failed_transfer_disarms_switch_even_without_a_scheduled_loop() {
+        let mut m = Master {
+            looping: true,
+            ..Master::default()
+        };
+        let transfer = m.transfer(Op::Read).unwrap();
+        m.record(Duration::ZERO, transfer, Err("I2C Nack".into()));
+        assert!(!m.looping && !m.looping());
+        assert_eq!(m.loop_note.as_deref(), Some("传输失败，循环已停止"));
     }
 }

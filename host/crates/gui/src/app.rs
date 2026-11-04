@@ -83,11 +83,21 @@ impl App {
     }
 
     fn fail(&mut self, msg: String) {
+        self.i2c.master.stop_loop("操作失败，循环已停止");
         self.tone = Tone::Red;
         self.status = msg;
     }
 
     fn start(&mut self, job: Job) {
+        if matches!(job, Job::Connect(_) | Job::Disconnect) {
+            self.i2c.master.stop_loop("连接操作，循环已停止");
+        }
+        // Enforce the same single-session rule as the controls and worker.
+        // A repeated Connect must not replace even the same physical bridge.
+        if matches!(job, Job::Connect(_)) && self.dev.conn.is_some() {
+            self.fail(worker::DISCONNECT_FIRST.into());
+            return;
+        }
         self.busy = true;
         // a refresh while connected leaves the last result in the footer
         if !(matches!(job, Job::Refresh) && self.dev.can_send()) {
@@ -99,7 +109,6 @@ impl App {
                 Job::Transfer(t) => format!("正在{} 0x{:02x}…", t.op.label(), t.addr),
             };
         }
-        // the open device, if any, stays until the worker has a new one
         if let Job::Connect(serial) = &job {
             self.connect_failed = false;
             self.connecting = Some(serial.clone());
@@ -107,6 +116,8 @@ impl App {
         if self.jobs.send(job).is_err() {
             self.busy = false;
             self.connecting = None;
+            self.dev.conn = None;
+            self.connect_failed = true;
             self.fail("USB worker 已关闭，需重开窗口".into());
         }
     }
@@ -146,6 +157,7 @@ impl App {
                         self.status = "已连接".into();
                     }
                 } else if self.dev.can_disconnect() {
+                    self.i2c.master.stop_loop("设备已断开，循环已停止");
                     self.fail("设备不在列表，先点断开".into());
                 } else {
                     self.tone = Tone::Neutral;
@@ -158,7 +170,10 @@ impl App {
             }
             Event::Devices(Err(e)) => self.fail(e),
             Event::Connected(result) => {
-                let serial = self.connecting.take().unwrap_or_default();
+                self.i2c.master.stop_loop("连接操作，循环已停止");
+                let Some(serial) = self.connecting.take() else {
+                    return;
+                };
                 match result {
                     Ok(firmware) => {
                         self.dev.conn = Some(Conn { serial, firmware });
@@ -166,18 +181,30 @@ impl App {
                         self.status = "已连接".into();
                     }
                     Err(e) => {
-                        // the worker kept the device that was open, if any
                         self.connect_failed = self.dev.conn.is_none();
                         self.fail(e);
                     }
                 }
             }
             Event::Disconnected => {
+                self.i2c.master.stop_loop("设备已断开，循环已停止");
                 self.dev.conn = None;
+                self.connecting = None;
+                self.connect_failed = false;
                 self.tone = Tone::Neutral;
                 self.status = "已断开".into();
             }
-            Event::Transfer { transfer, result } => {
+            Event::Transfer {
+                transfer,
+                result,
+                connection_lost,
+            } => {
+                if connection_lost {
+                    self.i2c.master.stop_loop("设备已断开，循环已停止");
+                    self.dev.conn = None;
+                    self.connecting = None;
+                    self.connect_failed = true;
+                }
                 let rec = self
                     .i2c
                     .master
@@ -420,5 +447,255 @@ fn fit_window(ctx: &egui::Context, fitted: &mut bool) {
             SIZE[0],
             rect.height().max(MIN_SIZE[1] + 120.0),
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use usb_i2c::bridge::DeviceInfo;
+
+    use super::*;
+
+    fn device(serial: &str) -> DeviceInfo {
+        DeviceInfo {
+            serial: serial.into(),
+            speed: "High".into(),
+        }
+    }
+
+    /// No worker thread or USB access: inspect exactly what the App queues.
+    fn connected_app() -> (App, Receiver<Job>) {
+        let (jobs, requests) = mpsc::channel();
+        let (_, events) = mpsc::channel();
+        let mut dev = Devices::default();
+        dev.set_list(vec![device("A"), device("B")]);
+        dev.conn = Some(Conn {
+            serial: "A".into(),
+            firmware: "firmware A".into(),
+        });
+        let mut app = App {
+            jobs,
+            events,
+            dev,
+            i2c: I2c::default(),
+            spi: Spi::default(),
+            pwm: Pwm::default(),
+            local: Local::default(),
+            page: Page::Device,
+            busy: false,
+            connecting: None,
+            connect_failed: false,
+            status: String::new(),
+            tone: Tone::Neutral,
+            opened: Instant::now(),
+            fitted: true,
+        };
+        app.i2c.master.arm_test_write_loop();
+        (app, requests)
+    }
+
+    fn poll_loop(app: &mut App) {
+        if let Some(op) =
+            app.i2c
+                .master
+                .loop_due(Duration::from_secs(60), app.dev.can_send(), app.busy)
+        {
+            app.start_transfer(op);
+        }
+    }
+
+    fn reconnect_a(app: &mut App, requests: &Receiver<Job>) {
+        app.act(Action::Connect("A".into()));
+        assert!(matches!(requests.try_recv(), Ok(Job::Connect(s)) if s == "A"));
+        app.on_event(Event::Connected(Ok("firmware A again".into())));
+        assert!(app.dev.can_send());
+        assert_eq!(app.dev.conn.as_ref().unwrap().serial, "A");
+        assert!(!app.i2c.master.looping());
+        poll_loop(app);
+        assert!(
+            requests.try_recv().is_err(),
+            "reconnect must not replay old writes"
+        );
+    }
+
+    #[test]
+    fn connect_action_refuses_replacement_and_same_serial_reopen() {
+        for serial in ["B", "A"] {
+            let (mut app, requests) = connected_app();
+            app.act(Action::Connect(serial.into()));
+            assert!(requests.try_recv().is_err());
+            let conn = app.dev.conn.as_ref().unwrap();
+            assert_eq!(conn.serial, "A");
+            assert_eq!(conn.firmware, "firmware A");
+            assert!(!app.busy);
+            assert!(app.connecting.is_none());
+            assert_eq!(app.status, worker::DISCONNECT_FIRST);
+            assert!(!app.i2c.master.looping());
+            poll_loop(&mut app);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn disconnect_action_stops_loop_immediately_and_reconnect_stays_disarmed() {
+        let (mut app, requests) = connected_app();
+        app.act(Action::Disconnect);
+        assert!(matches!(requests.try_recv(), Ok(Job::Disconnect)));
+        assert!(
+            !app.i2c.master.looping(),
+            "do not wait for an event or UI frame"
+        );
+        app.on_event(Event::Disconnected);
+        assert!(!app.dev.can_send());
+        // Reconnect immediately, with no disconnected UI frame in between.
+        reconnect_a(&mut app, &requests);
+    }
+
+    #[test]
+    fn disconnect_event_stops_loop_without_waiting_for_a_frame() {
+        let (mut app, requests) = connected_app();
+        app.on_event(Event::Disconnected);
+        assert!(!app.i2c.master.looping());
+        assert!(app.dev.conn.is_none());
+        reconnect_a(&mut app, &requests);
+    }
+
+    #[test]
+    fn connected_event_disarms_any_loop_enabled_during_connection() {
+        let (mut app, requests) = connected_app();
+        app.dev.conn = None;
+        app.act(Action::Connect("A".into()));
+        assert!(matches!(requests.try_recv(), Ok(Job::Connect(_))));
+        app.i2c.master.arm_test_write_loop();
+        app.on_event(Event::Connected(Ok("firmware A".into())));
+        assert!(!app.i2c.master.looping());
+        poll_loop(&mut app);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn unsolicited_connected_event_does_not_replace_active_bridge() {
+        let (mut app, _) = connected_app();
+        app.on_event(Event::Connected(Ok("other firmware".into())));
+        let conn = app.dev.conn.as_ref().unwrap();
+        assert_eq!(conn.serial, "A");
+        assert_eq!(conn.firmware, "firmware A");
+        assert!(!app.i2c.master.looping());
+    }
+
+    #[test]
+    fn transport_failure_clears_connection_blocks_requests_and_never_retries() {
+        let (mut app, requests) = connected_app();
+        let transfer = app.i2c.master.transfer(Op::Write).unwrap();
+        app.on_event(Event::Transfer {
+            transfer,
+            result: Err("USB reply timeout; reconnect required; write outcome unknown".into()),
+            connection_lost: true,
+        });
+        assert!(app.dev.conn.is_none());
+        assert!(!app.dev.can_send());
+        assert!(!app.i2c.master.looping());
+        assert_eq!(app.link(), Link::Failed);
+        assert!(app.status.contains("write outcome unknown"));
+        app.start_transfer(Op::Write);
+        poll_loop(&mut app);
+        assert!(requests.try_recv().is_err());
+        reconnect_a(&mut app, &requests);
+    }
+
+    #[test]
+    fn firmware_i2c_errors_stop_loop_but_allow_explicit_next_transfer() {
+        for reason in ["I2C 0x50: Nack", "I2C 0x50: Timeout"] {
+            let (mut app, requests) = connected_app();
+            let transfer = app.i2c.master.transfer(Op::Write).unwrap();
+            app.on_event(Event::Transfer {
+                transfer,
+                result: Err(reason.into()),
+                connection_lost: false,
+            });
+            assert!(app.dev.can_send());
+            assert_eq!(app.dev.conn.as_ref().unwrap().serial, "A");
+            assert!(!app.i2c.master.looping());
+            assert_eq!(app.link(), Link::On);
+            poll_loop(&mut app);
+            assert!(
+                requests.try_recv().is_err(),
+                "do not automatically retry an I2C error"
+            );
+            app.start_transfer(Op::Write);
+            assert!(matches!(requests.try_recv(), Ok(Job::Transfer(_))));
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn successful_transfer_preserves_the_requested_loop() {
+        let (mut app, requests) = connected_app();
+        let transfer = app.i2c.master.transfer(Op::Write).unwrap();
+        app.on_event(Event::Transfer {
+            transfer,
+            result: Ok(Vec::new()),
+            connection_lost: false,
+        });
+        assert!(app.dev.can_send());
+        assert!(app.i2c.master.looping());
+        poll_loop(&mut app);
+        let Ok(Job::Transfer(transfer)) = requests.try_recv() else {
+            panic!("the next requested loop transfer should be queued");
+        };
+        assert_eq!(transfer.op, Op::Write);
+        assert_eq!(transfer.wdata, [0, 0xaa]);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn missing_then_returning_device_does_not_resume_loop_between_frames() {
+        let (mut app, requests) = connected_app();
+        app.on_event(Event::Devices(Ok(vec![device("B")])));
+        assert!(!app.i2c.master.looping());
+        assert!(!app.dev.can_send());
+        assert_eq!(app.dev.connect_target(), None);
+        app.on_event(Event::Devices(Ok(vec![device("A"), device("B")])));
+        assert!(app.dev.can_send());
+        poll_loop(&mut app);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_connect_or_refresh_disarms_loop_without_retry() {
+        let (mut app, requests) = connected_app();
+        app.dev.conn = None;
+        app.act(Action::Connect("A".into()));
+        assert!(matches!(requests.try_recv(), Ok(Job::Connect(_))));
+        app.i2c.master.arm_test_write_loop();
+        app.on_event(Event::Connected(Err("PING failed".into())));
+        assert!(!app.i2c.master.looping());
+        assert!(app.dev.conn.is_none());
+        assert_eq!(app.link(), Link::Failed);
+        assert!(requests.try_recv().is_err());
+
+        let (mut app, requests) = connected_app();
+        app.on_event(Event::Devices(Err("USB enumeration failed".into())));
+        assert!(!app.i2c.master.looping());
+        assert!(
+            app.dev.can_send(),
+            "enumeration failure alone does not poison USB"
+        );
+        poll_loop(&mut app);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_worker_clears_connection_and_loop() {
+        let (mut app, requests) = connected_app();
+        drop(requests);
+        app.start_transfer(Op::Write);
+        assert!(!app.busy);
+        assert!(app.dev.conn.is_none());
+        assert!(!app.i2c.master.looping());
+        assert_eq!(app.link(), Link::Failed);
     }
 }

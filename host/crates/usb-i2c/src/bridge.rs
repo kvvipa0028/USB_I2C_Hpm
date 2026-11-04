@@ -1,19 +1,22 @@
 //! Open the bridge and run one request at a time.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
-use nusb::transfer::{Buffer, Bulk, In, Out};
 use nusb::MaybeFuture;
 
-use crate::proto::{self, Reply, Status, CMD_I2C, CMD_PING, HDR, PING_DATA_MAX};
+use crate::proto::{self, Reply, Status, CMD_I2C, CMD_PING, HDR, MAX_XFER, PING_DATA_MAX};
+
+mod transport;
+use transport::{Transport, UsbTransport};
 
 const VID: u16 = 0x1209;
 const PID: u16 = 0x0001;
 const PRODUCT: &str = "usb_i2c";
-const EP_OUT: u8 = 0x01;
-const EP_IN: u8 = 0x81;
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const TIMEOUT: Duration = Duration::from_secs(1);
+const CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SYNC_REPLIES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -38,18 +41,18 @@ fn is_bridge(d: &nusb::DeviceInfo) -> bool {
 }
 
 pub struct Bridge {
-    _iface: nusb::Interface,
-    out: nusb::Endpoint<Bulk, Out>,
-    inp: nusb::Endpoint<Bulk, In>,
-    seq: u8,
+    session: Session<UsbTransport>,
 }
 
 impl Bridge {
+    /// Open a connection and synchronize it using only harmless PING commands.
+    /// This never retries an earlier I2C operation or determines its outcome.
     pub fn open() -> anyhow::Result<Self> {
         Self::open_serial(None)
     }
 
     /// `serial` selects one bridge when more than one is plugged in.
+    /// Reopening is deliberate recovery, not a replay of a failed transaction.
     pub fn open_serial(serial: Option<&str>) -> anyhow::Result<Self> {
         let info = nusb::list_devices()
             .wait()?
@@ -63,26 +66,103 @@ impl Bridge {
                 None => anyhow!("no {PRODUCT} device ({VID:04x}:{PID:04x}) found"),
             })?;
         let iface = info.open().wait()?.claim_interface(0).wait()?;
-        let out = iface.endpoint::<Bulk, Out>(EP_OUT)?;
-        let inp = iface.endpoint::<Bulk, In>(EP_IN)?;
-        // start from a time-derived seq so a reply left over from an earlier run is not accepted
+        let transport = UsbTransport::new(iface)?;
+        // Vary the initial sequence, but do not rely on this 8-bit value alone
+        // to distinguish a fresh connection from an old reply.
         let seq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u8)
             .unwrap_or(0);
-        Ok(Bridge { _iface: iface, out, inp, seq })
+        let mut session = Session {
+            transport: Some(transport),
+            seq,
+        };
+        session.synchronize().map_err(|e| {
+            anyhow!("could not synchronize bridge: {e:#}; unplug/replug USB if reconnect fails")
+        })?;
+        Ok(Bridge { session })
+    }
+
+    /// False after a USB or protocol failure. Such a session cannot be reused:
+    /// drop it and explicitly open a new connection before sending more work.
+    /// A normal I2C NACK or firmware Timeout reply does not invalidate it.
+    pub fn is_usable(&self) -> bool {
+        self.session.is_usable()
+    }
+
+    pub fn ping_line(&mut self) -> anyhow::Result<String> {
+        self.session.ping_line()
+    }
+
+    pub fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
+        self.session.i2c(addr, wdata, rlen)
+    }
+}
+
+// The same request/session code runs against nusb and the focused queue model
+// in tests. There is never more than one submitted transfer per endpoint.
+struct Session<T> {
+    transport: Option<T>,
+    seq: u8,
+}
+
+impl<T: Transport> Session<T> {
+    fn is_usable(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    fn transport(&mut self) -> anyhow::Result<&mut T> {
+        self.transport
+            .as_mut()
+            .ok_or_else(|| anyhow!("bridge session is unusable; reconnect before another request"))
+    }
+
+    fn fail(&mut self, cmd: u8, error: anyhow::Error) -> anyhow::Error {
+        // Mark unusable and remove ownership before cleanup. nusb cancellation
+        // is asynchronous, and a timed-out OUT may already have reached I2C.
+        let mut pending = false;
+        if let Some(mut transport) = self.transport.take() {
+            transport.cancel_all();
+            let deadline = Instant::now() + CLEANUP_TIMEOUT;
+            if transport.pending_out() != 0 {
+                let _ = transport.wait_out(deadline.saturating_duration_since(Instant::now()));
+            }
+            if transport.pending_in() != 0 {
+                let _ = transport.wait_in(deadline.saturating_duration_since(Instant::now()));
+            }
+            pending = transport.pending_out() != 0 || transport.pending_in() != 0;
+            // Drop endpoints even if cancellation has not finished. nusb owns
+            // their buffers until completion; never wait indefinitely here.
+        }
+        let uncertainty = if cmd == CMD_I2C {
+            "; I2C operation may have executed and was not retried; USB cancellation cannot undo it"
+        } else {
+            ""
+        };
+        let cleanup = if pending {
+            "; USB cancellation is still pending"
+        } else {
+            ""
+        };
+        anyhow!(
+            "{error:#}{uncertainty}; bridge session is unusable; reconnect before another request{cleanup}"
+        )
     }
 
     fn transact(&mut self, cmd: u8, req: Vec<u8>, reply_max: usize) -> anyhow::Result<Reply> {
+        let transport = self.transport()?;
         let seq = req[1];
-        self.inp.submit(self.inp.allocate(proto::in_len(reply_max, self.inp.max_packet_size())));
-        let req = proto::pad_for_mps(req, self.out.max_packet_size());
-        self.out.submit(Buffer::from(req));
-        let c = self.out.wait_next_complete(TIMEOUT).ok_or_else(|| anyhow!("timeout sending request"))?;
-        c.status.context("sending request")?;
-        let c = self.inp.wait_next_complete(TIMEOUT).ok_or_else(|| anyhow!("timeout waiting for reply"))?;
-        c.status.context("receiving reply")?;
-        proto::decode(cmd, seq, &c.buffer[..c.actual_len]).map_err(|e| anyhow!(e))
+        transport.submit_in(reply_max);
+        let sent_len = transport.submit_out(req);
+        let result = (|| {
+            wait_out(transport, sent_len, TIMEOUT)?;
+            let bytes = wait_in(transport, TIMEOUT)?;
+            if bytes.len() > reply_max {
+                bail!("reply exceeds expected maximum of {reply_max} bytes");
+            }
+            proto::decode(cmd, seq, &bytes).map_err(|e| anyhow!(e))
+        })();
+        result.map_err(|e| self.fail(cmd, e))
     }
 
     fn next_seq(&mut self) -> u8 {
@@ -90,12 +170,83 @@ impl Bridge {
         self.seq
     }
 
-    pub fn ping_line(&mut self) -> anyhow::Result<String> {
+    fn synchronize(&mut self) -> anyhow::Result<()> {
+        let result = self.synchronize_inner();
+        result.map_err(|e| self.fail(CMD_PING, e))
+    }
+
+    fn synchronize_inner(&mut self) -> anyhow::Result<()> {
+        let deadline = Instant::now() + SYNC_TIMEOUT;
+        // First discard a whole completion. At full speed a stale exact-MPS
+        // I2C reply without a ZLP can coalesce with this short PING response.
+        // Discard both together rather than guessing boundaries in I2C data.
+        let seq = self.next_seq();
+        let transport = self.transport()?;
+        transport.submit_in(HDR + MAX_XFER);
+        let sent_len = transport.submit_out(proto::encode_ping(seq));
+        wait_out(
+            transport,
+            sent_len,
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        let _ = wait_in(
+            transport,
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        let mut replies = 1;
+        // With one caller, this firmware has at most one old TX reply and one
+        // accepted RX request. The discard removes the first old response.
+        // Two distinct PING sequences then protect against a remaining stale
+        // PING whose 8-bit seq collides. Fresh PINGs execute after old I2C work.
+        // This relies on the current firmware's single RX/TX slots and short
+        // PING response, not an unlimited reply queue or a device reset. A
+        // lost/corrupted reply fails closed; the old I2C outcome stays unknown.
+        for _ in 0..2 {
+            if Instant::now() >= deadline {
+                bail!("timeout synchronizing bridge");
+            }
+            if replies >= MAX_SYNC_REPLIES {
+                bail!("too many stale replies while synchronizing bridge");
+            }
+            let seq = self.next_seq();
+            let transport = self.transport()?;
+            // Keep accepting full-sized completions while draining, but only
+            // trust an entire correctly matched PING, never an embedded header.
+            transport.submit_in(HDR + MAX_XFER);
+            let sent_len = transport.submit_out(proto::encode_ping(seq));
+            wait_out(
+                transport,
+                sent_len,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            loop {
+                if replies >= MAX_SYNC_REPLIES {
+                    bail!("too many stale replies while synchronizing bridge");
+                }
+                let bytes = wait_in(
+                    transport,
+                    deadline.saturating_duration_since(Instant::now()),
+                )?;
+                replies += 1;
+                if let Ok(reply) = proto::decode(CMD_PING, seq, &bytes) {
+                    validate_ping(&reply)?;
+                    break;
+                }
+                if replies >= MAX_SYNC_REPLIES || Instant::now() >= deadline {
+                    bail!("too many stale replies while synchronizing bridge");
+                }
+                // Discard only during connection setup, never retry an I2C
+                // request after an unexpected reply in an established session.
+                transport.submit_in(HDR + MAX_XFER);
+            }
+        }
+        Ok(())
+    }
+
+    fn ping_line(&mut self) -> anyhow::Result<String> {
         let seq = self.next_seq();
         let r = self.transact(CMD_PING, proto::encode_ping(seq), HDR + PING_DATA_MAX)?;
-        if r.status != Status::Ok || r.data.is_empty() {
-            bail!("ping failed: {:?}", r.status);
-        }
+        validate_ping(&r).map_err(|e| self.fail(CMD_PING, e))?;
         Ok(format!(
             "protocol {} firmware \"{}\"",
             r.data[0],
@@ -103,16 +254,72 @@ impl Bridge {
         ))
     }
 
-    pub fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
+    fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
+        self.transport()?;
         let seq = self.next_seq();
         let req = proto::encode_i2c(seq, addr, wdata, rlen).map_err(|e| anyhow!(e))?;
         let r = self.transact(CMD_I2C, req, HDR + rlen)?;
+        if matches!(r.status, Status::Unknown(_)) || (r.status != Status::Ok && !r.data.is_empty())
+        {
+            return Err(self.fail(CMD_I2C, anyhow!("invalid I2C status reply: {:?}", r.status)));
+        }
         if r.status != Status::Ok {
+            // These are complete, matched firmware replies, not USB failures.
+            // Keeping the session does not imply that retrying an I2C write is safe.
             bail!("I2C 0x{addr:02x}: {:?} (hpm_stat {})", r.status, r.hpm_stat);
         }
         if r.data.len() != rlen {
-            bail!("expected {rlen} bytes, got {}", r.data.len());
+            return Err(self.fail(
+                CMD_I2C,
+                anyhow!("expected {rlen} bytes, got {}", r.data.len()),
+            ));
         }
         Ok(r.data)
     }
 }
+
+fn wait_out(
+    transport: &mut impl Transport,
+    sent_len: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let c = transport
+        .wait_out(timeout)
+        .ok_or_else(|| anyhow!("timeout sending request"))?;
+    c.status.context("sending request")?;
+    if c.actual_len != sent_len {
+        bail!(
+            "short USB request: sent {} of {sent_len} bytes",
+            c.actual_len
+        );
+    }
+    Ok(())
+}
+
+fn wait_in(transport: &mut impl Transport, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let c = transport
+        .wait_in(timeout)
+        .ok_or_else(|| anyhow!("timeout waiting for reply"))?;
+    c.status.context("receiving reply")?;
+    c.buffer
+        .get(..c.actual_len)
+        .map(|b| b.to_vec())
+        .ok_or_else(|| anyhow!("invalid USB reply length {}", c.actual_len))
+}
+
+fn validate_ping(reply: &Reply) -> anyhow::Result<()> {
+    if reply.status != Status::Ok || reply.data.is_empty() || reply.data.len() > PING_DATA_MAX {
+        bail!(
+            "invalid PING reply: {:?} ({} data bytes)",
+            reply.status,
+            reply.data.len()
+        );
+    }
+    if reply.data[0] != 1 {
+        bail!("unsupported bridge protocol {}", reply.data[0]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

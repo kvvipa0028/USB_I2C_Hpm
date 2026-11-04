@@ -10,7 +10,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::chart::{self, Chart};
-use crate::local::{self, label, parse_num, parse_real, Noise, Saved, Ticker, TICK};
+use crate::local::{self, label, parse_num, parse_real, Noise, Saved};
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
 
@@ -22,6 +22,9 @@ const BITS: [(u32, &str); 3] = [(10, "10 bit"), (12, "12 bit"), (16, "16 bit")];
 const EXPORTS: [(bool, &str); 2] = [(false, "CSV"), (true, "原始二进制")];
 /// Samples kept for the chart, the table, and the copy.
 const KEEP: usize = 4000;
+/// After a delayed UI frame, generate at most this many of the newest due
+/// samples. Earlier due slots are counted as dropped, never replayed later.
+const CATCH_UP_MAX: u64 = KEEP as u64;
 /// Points drawn at most; older ones scroll off the left.
 const SHOWN: usize = 240;
 const RATE_MAX: u32 = 10_000;
@@ -124,9 +127,11 @@ pub struct Adc {
     saved: Saved<Config>,
     open: bool,
     recording: bool,
-    ticker: Ticker,
-    /// Samples taken in this recording, kept or not.
+    started: Duration,
+    /// Samples generated in this recording, including ones aged out of KEEP.
     taken: u64,
+    /// Scheduled sample slots skipped to keep a delayed refresh bounded.
+    dropped: u64,
     params: Option<Params>,
     samples: VecDeque<Sample>,
     noise: Noise,
@@ -165,8 +170,9 @@ impl Default for Adc {
             saved: Saved::default(),
             open: false,
             recording: false,
-            ticker: Ticker::new(Duration::ZERO),
+            started: Duration::ZERO,
             taken: SEED.len() as u64,
+            dropped: 0,
             params: None,
             samples,
             noise: Noise::new(0xad1),
@@ -184,35 +190,49 @@ impl Adc {
         self.params = Some(p);
         self.samples.clear();
         self.taken = 0;
+        self.dropped = 0;
         self.frozen = None;
         self.recording = true;
         self.done = false;
         self.copied = None;
-        self.ticker = Ticker::new(now);
+        self.started = now;
         Ok(())
     }
 
-    /// Take the samples due since the last tick; stop at the set duration.
+    fn stop(&mut self, now: Duration) {
+        self.tick(now);
+        self.recording = false;
+    }
+
+    /// Sample k (starting at 1) is due at elapsed k/rate and has that same
+    /// timestamp. Integer elapsed-time arithmetic carries fractional samples
+    /// across frames. The sample at the exact duration boundary is included,
+    /// and the first refresh at/after that boundary ends the recording.
+    /// A long UI sleep keeps only the newest CATCH_UP_MAX due slots; gaps
+    /// remain visible in timestamps and in the dropped count.
     pub fn tick(&mut self, now: Duration) -> bool {
         let Some(p) = self.params.filter(|_| self.recording) else {
             return false;
         };
-        let ticks = self.ticker.take(now, TICK, 4).len() as u64;
-        let per_tick = (u64::from(p.rate) * TICK.as_millis() as u64).div_ceil(1000);
-        let end = u64::from(p.seconds) * u64::from(p.rate);
-        for _ in 0..ticks * per_tick {
-            if self.taken >= end {
-                self.recording = false;
-                self.done = true;
-                break;
-            }
-            let t = self.taken as f64 / f64::from(p.rate);
+        let elapsed = now.saturating_sub(self.started);
+        let duration = Duration::from_secs(u64::from(p.seconds));
+        let due = (elapsed.min(duration).as_nanos() * u128::from(p.rate)
+            / Duration::from_secs(1).as_nanos()) as u64;
+        let pending = due.saturating_sub(self.taken + self.dropped);
+        let count = pending.min(CATCH_UP_MAX);
+        self.dropped += pending - count;
+        for index in due - count..due {
+            let t = (index + 1) as f64 / f64::from(p.rate);
             let (code, volts) = p.convert(signal(t, &mut self.noise));
             self.samples.push_back(Sample { t, code, volts });
             if self.samples.len() > KEEP {
                 self.samples.pop_front();
             }
             self.taken += 1;
+        }
+        if elapsed >= duration {
+            self.recording = false;
+            self.done = true;
         }
         self.recording
     }
@@ -262,7 +282,7 @@ pub fn page(ui: &mut egui::Ui, a: &mut Adc, now: Duration) {
                 .clicked()
             {
                 if a.recording {
-                    a.recording = false;
+                    a.stop(now);
                 } else {
                     refused = a.start(now).err();
                 }
@@ -303,6 +323,10 @@ pub fn page(ui: &mut egui::Ui, a: &mut Adc, now: Duration) {
             widgets::note(
                 ui,
                 "采集与显示解耦：暂停显示只冻结曲线，记录继续。当前固件没有 AD 命令。",
+            );
+            widgets::note(
+                ui,
+                "界面长时间未刷新时最多补齐 4000 个最新样本，其余计为丢样；时间按记录开始计算。",
             );
         });
 }
@@ -471,7 +495,7 @@ fn foot(ui: &mut egui::Ui, a: &mut Adc) {
                 for (k, v) in [
                     ("最小值", lo),
                     ("最大值", hi),
-                    ("丢样", "0".into()),
+                    ("丢样", a.dropped.to_string()),
                     ("状态", status),
                     ("记录文件", "adc-session-demo.csv".into()),
                 ] {
@@ -533,6 +557,148 @@ mod tests {
         assert_eq!(a.visible().len(), 60);
         assert!(a
             .export()
-            .starts_with("time_s,channel,code,volts\n0.000000,AD1,"));
+            .starts_with("time_s,channel,code,volts\n0.010000,AD1,"));
+    }
+
+    #[test]
+    fn rate_matrix_counts_fractional_samples_and_ends_at_wall_time() {
+        for rate in [1u32, 5, 10, 19, 20, 21, 50, 100, 128, 1000, 1001, 10_000] {
+            let mut a = Adc::default();
+            a.cfg.rate = rate.to_string();
+            a.cfg.seconds = "60".into();
+            let started = Duration::from_secs(123);
+            a.start(started).unwrap();
+            assert!(a.tick(started));
+            assert!(a.samples.is_empty());
+            for i in 1..=1200 {
+                let active = a.tick(started + Duration::from_millis(i * 50));
+                assert_eq!(a.taken, u64::from(rate) * i / 20, "rate={rate}, tick={i}");
+                assert_eq!(active, i < 1200, "rate={rate}, tick={i}");
+                assert_eq!(a.done, i == 1200);
+                if i == 20 {
+                    let first = a.taken - a.samples.len() as u64 + 1;
+                    assert_eq!(a.samples.front().unwrap().t, first as f64 / f64::from(rate));
+                    assert_eq!(a.samples.back().unwrap().t, 1.0);
+                }
+            }
+            assert_eq!(a.taken, u64::from(rate) * 60);
+            assert_eq!(a.dropped, 0);
+            assert_eq!(a.samples.back().unwrap().t, 60.0);
+            assert_eq!(a.samples.len(), KEEP.min(a.taken as usize));
+            assert!(!a.tick(started + Duration::from_secs(120)));
+            assert_eq!(a.taken, u64::from(rate) * 60);
+        }
+    }
+
+    #[test]
+    fn first_sample_is_due_at_its_timestamp_not_at_the_first_ui_tick() {
+        for rate in [1u32, 21, 50, 1000, RATE_MAX] {
+            let mut a = Adc::default();
+            a.cfg.rate = rate.to_string();
+            a.start(Duration::ZERO).unwrap();
+            let first_ns = 1_000_000_000u64.div_ceil(u64::from(rate));
+            a.tick(Duration::from_nanos(first_ns - 1));
+            assert_eq!(a.taken, 0, "rate={rate}");
+            a.tick(Duration::from_nanos(first_ns));
+            assert_eq!(a.taken, 1, "rate={rate}");
+            assert_eq!(a.samples.front().unwrap().t, 1.0 / f64::from(rate));
+            // Duplicate and backwards clock observations do not duplicate slots.
+            a.tick(Duration::from_nanos(first_ns));
+            a.tick(Duration::ZERO);
+            assert_eq!(a.taken, 1);
+        }
+    }
+
+    #[test]
+    fn irregular_frames_follow_elapsed_time_without_rounding_drift() {
+        for rate in [1u32, 21, 50, 1000, RATE_MAX] {
+            let mut a = Adc::default();
+            a.cfg.rate = rate.to_string();
+            a.cfg.seconds = "2".into();
+            a.start(Duration::from_millis(750)).unwrap();
+            for ms in [
+                7u64, 49, 73, 150, 299, 450, 601, 799, 1001, 1234, 1499, 1751, 1999, 2051,
+            ] {
+                a.tick(Duration::from_millis(750 + ms));
+                let expected = ms.min(2000) * u64::from(rate) / 1000;
+                assert_eq!(a.taken, expected, "rate={rate}, elapsed_ms={ms}");
+                assert_eq!(a.dropped, 0);
+                assert_eq!(a.recording, ms < 2000);
+                if let Some(last) = a.samples.back() {
+                    assert_eq!(last.t, expected as f64 / f64::from(rate));
+                    assert!(last.t <= ms as f64 / 1000.0);
+                }
+            }
+            assert!(a.done);
+            assert_eq!(a.samples.back().unwrap().t, 2.0);
+        }
+    }
+
+    #[test]
+    fn long_ui_sleep_drops_old_due_slots_and_preserves_time_gaps() {
+        let mut a = Adc::default();
+        a.cfg.rate = RATE_MAX.to_string();
+        a.cfg.seconds = "3600".into();
+        a.start(Duration::from_secs(10)).unwrap();
+        a.tick(Duration::from_millis(10_050));
+        assert_eq!(a.taken, 500);
+        assert_eq!(a.samples.back().unwrap().t, 0.05);
+
+        a.tick(Duration::from_secs(11));
+        assert_eq!(a.taken, 500 + CATCH_UP_MAX);
+        assert_eq!(a.dropped, 10_000 - 500 - CATCH_UP_MAX);
+        assert_eq!(a.samples.len(), KEEP);
+        assert_eq!(a.samples.front().unwrap().t, 0.6001);
+        assert_eq!(a.samples.back().unwrap().t, 1.0);
+        assert!(a
+            .export()
+            .starts_with("time_s,channel,code,volts\n0.600100,AD1,"));
+
+        // Skipped slots never turn into a backlog on the following refresh.
+        a.tick(Duration::from_millis(11_050));
+        assert_eq!(a.taken, 1000 + CATCH_UP_MAX);
+        assert_eq!(a.dropped, 10_000 - 500 - CATCH_UP_MAX);
+        assert_eq!(a.samples.back().unwrap().t, 1.05);
+
+        // One refresh after an hour is still bounded, and finishes immediately.
+        let taken = a.taken;
+        assert!(!a.tick(Duration::from_secs(3611)));
+        assert_eq!(a.taken - taken, CATCH_UP_MAX);
+        assert_eq!(a.taken + a.dropped, u64::from(RATE_MAX) * 3600);
+        assert_eq!(a.samples.len(), KEEP);
+        assert_eq!(a.samples.back().unwrap().t, 3600.0);
+        assert!(a.done);
+        let counts = (a.taken, a.dropped);
+        a.tick(Duration::MAX);
+        assert_eq!((a.taken, a.dropped), counts);
+    }
+
+    #[test]
+    fn low_rate_long_gap_still_ends_at_duration_and_stop_restart_resets_counts() {
+        let mut a = Adc::default();
+        a.cfg.rate = "1".into();
+        a.start(Duration::ZERO).unwrap();
+        assert!(!a.tick(Duration::from_secs(120)));
+        assert_eq!((a.taken, a.dropped), (60, 0));
+        assert_eq!(a.samples.front().unwrap().t, 1.0);
+        assert_eq!(a.samples.back().unwrap().t, 60.0);
+
+        a.cfg.rate = "21".into();
+        a.start(Duration::from_secs(200)).unwrap();
+        a.stop(Duration::from_millis(200_500));
+        assert_eq!((a.taken, a.dropped), (10, 0));
+        assert!(!a.recording && !a.done);
+        a.tick(Duration::from_secs(201));
+        assert_eq!(a.taken, 10);
+        a.frozen = Some(5);
+        assert_eq!(a.visible().len(), 5);
+
+        a.dropped = 10;
+        a.start(Duration::from_secs(300)).unwrap();
+        assert_eq!((a.taken, a.dropped), (0, 0));
+        assert!(a.samples.is_empty() && a.frozen.is_none());
+        assert!(a.tick(Duration::from_millis(300_050)));
+        assert_eq!(a.taken, 1);
+        assert_eq!(a.samples.front().unwrap().t, 1.0 / 21.0);
     }
 }

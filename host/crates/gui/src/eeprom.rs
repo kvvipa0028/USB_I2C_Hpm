@@ -78,6 +78,8 @@ impl Default for Config {
 /// What a checked config will do.
 #[derive(Clone, Debug, PartialEq)]
 struct Plan {
+    /// The checked configuration stays with this job, even after it ends.
+    cfg: Config,
     mode: Mode,
     addr: u8,
     start: u32,
@@ -133,8 +135,11 @@ struct Report {
     readback: Vec<u8>,
     mismatches: usize,
     complete: bool,
+    error: Option<&'static str>,
     ended: Duration,
 }
+
+const STORAGE_ERROR: &str = "演示镜像范围与作业不一致，未完成验证。";
 
 pub struct Eeprom {
     cfg: Config,
@@ -142,6 +147,8 @@ pub struct Eeprom {
     advanced: bool,
     mode: Mode,
     data: String,
+    /// Keep bytes beyond the selected capacity so shrink/grow does not erase
+    /// the local image or invalidate an already checked job.
     mem: Vec<u8>,
     view: u32,
     step: Step,
@@ -151,6 +158,7 @@ pub struct Eeprom {
     snapshot: bool,
     /// Why 检查并进入执行 refused, until the config changes.
     refused: Vec<String>,
+    failure: Option<&'static str>,
 }
 
 impl Default for Eeprom {
@@ -170,6 +178,7 @@ impl Default for Eeprom {
             report: None,
             snapshot: true,
             refused: Vec::new(),
+            failure: None,
         }
     }
 }
@@ -215,6 +224,7 @@ impl Eeprom {
         }
         match (addr, start, len) {
             (Some(addr), Some(start), Some(len)) if errs.is_empty() => Ok(Plan {
+                cfg: c.clone(),
                 mode: self.mode,
                 addr,
                 start,
@@ -227,6 +237,10 @@ impl Eeprom {
     }
 
     fn start(&mut self, now: Duration) {
+        if self.running() {
+            return;
+        }
+        self.set_capacity();
         match self.check() {
             Ok(plan) => {
                 self.task = Some(Task::new(plan.stages(self.cfg.ack_poll), now));
@@ -234,6 +248,7 @@ impl Eeprom {
                 self.report = None;
                 self.step = Step::Run;
                 self.refused.clear();
+                self.failure = None;
             }
             Err(e) => self.refused = e,
         }
@@ -247,7 +262,18 @@ impl Eeprom {
         };
         let (s, n) = (plan.start as usize, plan.len as usize);
         if plan.mode == Mode::Write && i == 0 {
-            self.mem[s..s + n].copy_from_slice(&plan.data);
+            let dst = s.checked_add(n).and_then(|end| self.mem.get_mut(s..end));
+            match dst {
+                Some(dst) if dst.len() == plan.data.len() => dst.copy_from_slice(&plan.data),
+                _ => {
+                    self.failure = Some(STORAGE_ERROR);
+                    if let Some(task) = &mut self.task {
+                        task.stop(now);
+                    }
+                    self.finish(now);
+                    return;
+                }
+            }
         }
         if self.task.as_ref().is_some_and(|t| !t.running()) {
             self.finish(now);
@@ -259,7 +285,13 @@ impl Eeprom {
             return;
         };
         let (s, n) = (plan.start as usize, plan.len as usize);
-        let readback = self.mem[s..s + n].to_vec();
+        let readback = match s.checked_add(n).and_then(|end| self.mem.get(s..end)) {
+            Some(data) => data.to_vec(),
+            None => {
+                self.failure = Some(STORAGE_ERROR);
+                Vec::new()
+            }
+        };
         let mismatches = match plan.mode {
             Mode::Read => 0,
             Mode::Write => readback
@@ -269,20 +301,21 @@ impl Eeprom {
                 .count(),
         };
         self.report = Some(Report {
+            cfg: plan.cfg.clone(),
             plan,
-            cfg: self.cfg.clone(),
             readback,
             mismatches,
-            complete: task.state == job::State::Done,
+            complete: task.state == job::State::Done && self.failure.is_none(),
+            error: self.failure,
             ended: now,
         });
     }
 
     fn set_capacity(&mut self) {
-        if self.mem.len() != self.cfg.capacity as usize {
+        if self.mem.len() < self.cfg.capacity as usize {
             self.mem.resize(self.cfg.capacity as usize, 0xff);
-            self.view = self.view.min(self.cfg.capacity.saturating_sub(1) / VIEW);
         }
+        self.view = self.view.min(self.cfg.capacity.saturating_sub(1) / VIEW);
     }
 }
 
@@ -311,11 +344,22 @@ pub fn page(ui: &mut egui::Ui, e: &mut Eeprom, now: Duration) {
         .auto_shrink([false, false])
         .show(ui, |ui| match e.step {
             Step::Check => {
-                widgets::work_columns(ui, e, 264.0, 760.0, config, |ui, e| {
-                    plan_card(ui, e, now);
-                    ui.add_space(14.0);
-                    memory(ui, e);
-                });
+                widgets::work_columns(
+                    ui,
+                    e,
+                    264.0,
+                    760.0,
+                    |ui, e| {
+                        ui.add_enabled_ui(!e.running(), |ui| config(ui, e))
+                            .response
+                            .on_disabled_hover_text("先停止当前任务");
+                    },
+                    |ui, e| {
+                        ui.add_enabled_ui(!e.running(), |ui| plan_card(ui, e, now));
+                        ui.add_space(14.0);
+                        memory(ui, e);
+                    },
+                );
             }
             Step::Run => run(ui, e, now),
             Step::Report => report(ui, e),
@@ -374,6 +418,7 @@ fn config(ui: &mut egui::Ui, e: &mut Eeprom) {
     ui.add_space(8.0);
     widgets::note(ui, "容量、地址组织与页大小必须匹配具体器件。");
     widgets::note(ui, "跨页自动拆分；写入前展示覆盖范围，写后读回校验。");
+    widgets::note(ui, "容量切换保留已有演示数据，重新扩大后可查看。");
 }
 
 fn plan_card(ui: &mut egui::Ui, e: &mut Eeprom, now: Duration) {
@@ -474,6 +519,9 @@ fn plan_card(ui: &mut egui::Ui, e: &mut Eeprom, now: Duration) {
 }
 
 fn memory(ui: &mut egui::Ui, e: &mut Eeprom) {
+    // Config (including saved-config restore) can change capacity earlier in
+    // this very frame. Reconcile before calculating either end of the slice.
+    e.set_capacity();
     let pages = e.cfg.capacity.div_ceil(VIEW);
     let base = e.view * VIEW;
     let plan = e.check().ok();
@@ -547,6 +595,9 @@ fn run(ui: &mut egui::Ui, e: &mut Eeprom, now: Duration) {
     } else if ended && e.report.is_none() {
         e.finish(now);
     }
+    if let Some(error) = e.failure {
+        widgets::error(ui, error);
+    }
 }
 
 fn report(ui: &mut egui::Ui, e: &mut Eeprom) {
@@ -555,7 +606,9 @@ fn report(ui: &mut egui::Ui, e: &mut Eeprom) {
         widgets::muted(ui, "任务结束后在这里查看报告。");
         return;
     };
-    let (badge, tone) = if r.complete {
+    let (badge, tone) = if r.error.is_some() {
+        ("验证失败", Tone::Red)
+    } else if r.complete {
         ("演示完成", Tone::Green)
     } else {
         ("已停止 · 未完成", Tone::Amber)
@@ -581,13 +634,14 @@ fn report(ui: &mut egui::Ui, e: &mut Eeprom) {
                 false,
                 false,
             );
-            let verdict = match (p.mode, r.complete) {
-                (_, false) => "任务在安全边界停止，未完成验证".to_owned(),
-                (Mode::Read, true) => format!("读取 {} B，长度与地址范围核对一致", p.len),
-                (Mode::Write, true) if r.mismatches == 0 => {
+            let verdict = match (r.error, p.mode, r.complete) {
+                (Some(error), _, _) => error.to_owned(),
+                (_, _, false) => "任务在安全边界停止，未完成验证".to_owned(),
+                (_, Mode::Read, true) => format!("读取 {} B，长度与地址范围核对一致", p.len),
+                (_, Mode::Write, true) if r.mismatches == 0 => {
                     format!("写入 {} B，分 {} 段，读回比较一致", p.len, p.chunks.len())
                 }
-                (Mode::Write, true) => format!("读回比较 {} 处不一致", r.mismatches),
+                (_, Mode::Write, true) => format!("读回比较 {} 处不一致", r.mismatches),
             };
             job::line(ui, "最终验证", &verdict, false, false);
             job::line(ui, "结束时间", &clock(r.ended), true, false);
@@ -628,6 +682,113 @@ fn report(ui: &mut egui::Ui, e: &mut Eeprom) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the production page with pointer/text events, including popup
+    /// selection in the same frame as memory rendering. No display/GPU needed.
+    struct Harness {
+        ctx: egui::Context,
+        time: f64,
+        texts: Vec<(String, egui::Pos2)>,
+    }
+
+    impl Harness {
+        fn new(e: &mut Eeprom) -> Self {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx);
+            let mut h = Self {
+                ctx,
+                time: 0.0,
+                texts: Vec::new(),
+            };
+            h.frame(e, vec![]);
+            h
+        }
+
+        fn frame(&mut self, e: &mut Eeprom, events: Vec<egui::Event>) {
+            self.time += 0.02;
+            let now = Duration::from_secs_f64(self.time);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 900.0),
+                )),
+                time: Some(self.time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = self.ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| page(ui, e, now));
+            });
+            out.textures_delta.clear();
+            self.texts.clear();
+            for shape in out.shapes {
+                self.collect(&shape.shape, shape.clip_rect);
+            }
+        }
+
+        fn collect(&mut self, shape: &egui::Shape, clip: egui::Rect) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let center = text.pos + text.galley.rect.center().to_vec2();
+                    if clip.contains(center) {
+                        self.texts.push((text.galley.text().into(), center));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        self.collect(shape, clip);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn click(&mut self, e: &mut Eeprom, label: &str) {
+            let pos = self
+                .texts
+                .iter()
+                .rev()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("missing visible label {label:?}: {:?}", self.texts))
+                .1;
+            self.frame(e, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                self.frame(
+                    e,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    }],
+                );
+            }
+            self.frame(e, vec![]);
+        }
+
+        fn replace(&mut self, e: &mut Eeprom, before: &str, after: &str) {
+            self.click(e, before);
+            self.frame(
+                e,
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            ctrl: true,
+                            command: true,
+                            ..Default::default()
+                        },
+                    },
+                    egui::Event::Text(after.into()),
+                ],
+            );
+            self.frame(e, vec![]);
+        }
+    }
 
     #[test]
     fn chunks_keep_to_pages() {
@@ -679,5 +840,190 @@ mod tests {
         e.finish(Duration::from_secs(1));
         assert!(!e.report.as_ref().unwrap().complete);
         assert_eq!(&e.mem[..9], b"BusStudio");
+    }
+
+    #[test]
+    fn pointer_capacity_shrink_clamps_view_in_the_selection_frame() {
+        for next_clicks in 0..=2 {
+            let mut e = Eeprom::default();
+            let mut h = Harness::new(&mut e);
+            for _ in 0..next_clicks {
+                h.click(&mut e, "下一页 ›");
+            }
+            assert_eq!(e.view, next_clicks);
+            h.click(&mut e, "8192 B · 24C64");
+            h.click(&mut e, "128 B · 24C01");
+            assert_eq!(e.cfg.capacity, 128);
+            assert_eq!(e.view, 0);
+            assert_eq!(&e.mem[..9], b"BusStudio");
+            assert!(h.texts.iter().any(|(text, _)| text.contains("第 1 / 1 页")));
+
+            h.click(&mut e, "检查并进入执行");
+            assert!(e.running());
+            h.click(&mut e, "停止任务");
+            let r = e.report.as_ref().unwrap();
+            assert!(!r.complete && r.error.is_none());
+            assert_eq!(r.readback.len(), 128);
+        }
+    }
+
+    #[test]
+    fn pointer_active_job_locks_capacity_restore_and_plan_until_stopped() {
+        for write in [false, true] {
+            let mut e = Eeprom::default();
+            let saved = Config {
+                capacity: 128,
+                ..Config::default()
+            };
+            e.saved.save(&saved, Duration::ZERO);
+            let mut h = Harness::new(&mut e);
+            h.replace(&mut e, "0x0000", "0x0100");
+            assert_eq!(e.cfg.start, "0x0100");
+            if write {
+                h.click(&mut e, "写入");
+                assert_eq!(e.mode, Mode::Write);
+            }
+            h.click(&mut e, "检查并进入执行");
+            assert!(e.running());
+            assert_eq!(e.plan.as_ref().unwrap().start, 0x100);
+            h.click(&mut e, "配置与检查");
+            assert_eq!(e.step, Step::Check);
+            h.click(&mut e, "8192 B · 24C64");
+            assert!(!h.texts.iter().any(|(text, _)| text == "128 B · 24C01"));
+            h.click(&mut e, "撤销修改");
+            assert_eq!(e.cfg.capacity, 8192);
+            assert_eq!(e.cfg.start, "0x0100");
+            h.click(&mut e, if write { "读取" } else { "写入" });
+            assert_eq!(e.mode, if write { Mode::Write } else { Mode::Read });
+
+            h.click(&mut e, "执行任务");
+            if write {
+                h.click(&mut e, "推进演示阶段");
+                assert_eq!(&e.mem[0x100..0x109], b"BusStudio");
+            }
+            h.click(&mut e, "停止任务");
+            assert!(!e.running());
+            let r = e.report.as_ref().unwrap();
+            assert!(!r.complete && r.error.is_none());
+            assert_eq!(r.cfg.capacity, 8192);
+            assert_eq!(r.cfg.start, "0x0100");
+            assert_eq!(r.readback.len(), if write { 9 } else { 128 });
+
+            h.click(&mut e, "配置与检查");
+            h.click(&mut e, "8192 B · 24C64");
+            h.click(&mut e, "128 B · 24C01");
+            assert_eq!(e.cfg.capacity, 128);
+            assert_eq!(e.report.as_ref().unwrap().cfg.capacity, 8192);
+            h.click(&mut e, "128 B · 24C01");
+            h.click(&mut e, "8192 B · 24C64");
+            assert_eq!(e.cfg.capacity, 8192);
+            if write {
+                assert_eq!(&e.mem[0x100..0x109], b"BusStudio");
+            }
+        }
+    }
+
+    #[test]
+    fn checked_job_survives_draft_changes_and_preserves_its_snapshot() {
+        let mut e = Eeprom {
+            mode: Mode::Write,
+            data: "de ad be ef".into(),
+            ..Eeprom::default()
+        };
+        e.cfg.start = "0x0100".into();
+        e.start(Duration::ZERO);
+        // Even a caller bypassing the disabled UI cannot shrink the backing
+        // image or replace the active job with a newly checked draft.
+        e.cfg.capacity = 128;
+        e.cfg.start = "0x0000".into();
+        e.cfg.channel = 2;
+        e.set_capacity();
+        e.start(Duration::from_secs(1));
+        assert_eq!(e.plan.as_ref().unwrap().start, 0x100);
+        for _ in 0..3 {
+            let i = e
+                .task
+                .as_mut()
+                .unwrap()
+                .advance(Duration::from_secs(2))
+                .unwrap();
+            e.on_stage(i, Duration::from_secs(2));
+        }
+        let r = e.report.as_ref().unwrap();
+        assert!(r.complete && r.error.is_none());
+        assert_eq!(r.readback, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(r.cfg.capacity, 8192);
+        assert_eq!(r.cfg.start, "0x0100");
+        assert_eq!(r.cfg.channel, 1);
+    }
+
+    #[test]
+    fn stopping_checked_read_after_capacity_change_keeps_original_range() {
+        for start in [0u32, 1, 128, 256] {
+            let mut e = Eeprom::default();
+            e.cfg.start = format!("0x{start:04X}");
+            e.start(Duration::ZERO);
+            let expected = e.mem[start as usize..start as usize + 128].to_vec();
+            e.cfg.capacity = 128;
+            e.set_capacity();
+            e.task.as_mut().unwrap().stop(Duration::from_secs(1));
+            e.finish(Duration::from_secs(1));
+            let r = e.report.as_ref().unwrap();
+            assert!(!r.complete && r.error.is_none());
+            assert_eq!(r.readback, expected);
+            assert_eq!(r.cfg.capacity, 8192);
+            assert_eq!(r.plan.start, start);
+        }
+    }
+
+    #[test]
+    fn shrink_grow_and_saved_restore_preserve_existing_image_bytes() {
+        let mut e = Eeprom::default();
+        e.mem[8000] = 0x42;
+        e.cfg.capacity = 128;
+        e.saved.save(&e.cfg, Duration::ZERO);
+        e.cfg.capacity = 8192;
+        e.view = 63;
+        let mut h = Harness::new(&mut e);
+        h.click(&mut e, "撤销修改");
+        assert_eq!((e.cfg.capacity, e.view), (128, 0));
+        e.cfg.capacity = 32768;
+        e.set_capacity();
+        assert_eq!(e.mem[8000], 0x42);
+        assert_eq!(&e.mem[..9], b"BusStudio");
+        assert!(e.mem[8192..].iter().all(|b| *b == 0xff));
+        assert_eq!(e.mem.len(), 32768);
+    }
+
+    #[test]
+    fn invalid_backing_range_stops_write_and_reports_failure_without_panicking() {
+        for mode in [Mode::Read, Mode::Write] {
+            let mut e = Eeprom {
+                mode,
+                ..Eeprom::default()
+            };
+            e.cfg.start = "0x0100".into();
+            e.start(Duration::ZERO);
+            // Fault injection: normal capacity changes retain these bytes.
+            e.mem.truncate(128);
+            if mode == Mode::Write {
+                let i = e
+                    .task
+                    .as_mut()
+                    .unwrap()
+                    .advance(Duration::from_secs(1))
+                    .unwrap();
+                e.on_stage(i, Duration::from_secs(1));
+            } else {
+                e.task.as_mut().unwrap().stop(Duration::from_secs(1));
+                e.finish(Duration::from_secs(1));
+            }
+            assert!(!e.running());
+            let r = e.report.as_ref().unwrap();
+            assert!(!r.complete);
+            assert_eq!(r.error, Some(STORAGE_ERROR));
+            assert!(r.readback.is_empty());
+            assert_eq!(&e.mem[..9], b"BusStudio");
+        }
     }
 }
