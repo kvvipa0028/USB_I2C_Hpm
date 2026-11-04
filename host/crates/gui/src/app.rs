@@ -259,10 +259,12 @@ impl eframe::App for App {
         if self.pwm.running() {
             live.push(Page::Pwm);
         }
-        // EEPROM, Flash and UDS step on clicks; only timed demos need frames
+        // EEPROM, Flash and the UDS demo step on clicks; only timed demos and
+        // the UDS simulated run need frames
         let timed = live
             .iter()
-            .any(|p| !matches!(p, Page::Eeprom | Page::Flash | Page::Uds | Page::Pwm));
+            .any(|p| !matches!(p, Page::Eeprom | Page::Flash | Page::Uds | Page::Pwm))
+            || self.local.uds.timed();
         if timed || pwm_timed || self.i2c.master.looping() {
             ui.ctx().request_repaint_after(local::TICK);
         }
@@ -406,7 +408,7 @@ impl Local {
             (self.ads1015.tick(now), Page::Ads1015),
             (self.eeprom.running(), Page::Eeprom),
             (self.flash.running(), Page::Flash),
-            (self.uds.running(), Page::Uds),
+            (self.uds.tick(now), Page::Uds),
         ] {
             if running {
                 live.push(page);
@@ -430,7 +432,7 @@ fn footer_note(page: Page) -> &'static str {
         Page::Ads1015 => "ADS1015 · 模拟数据，不发 I2C",
         Page::Eeprom => "EEPROM · 演示镜像",
         Page::Flash => "Flash · 演示镜像",
-        Page::Uds => "UDS · 演示流程",
+        Page::Uds => "UDS · 页面演示 / 模拟执行，不经 USB",
     }
 }
 

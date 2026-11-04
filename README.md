@@ -17,6 +17,7 @@
 | I2C 从机寄存器表 | 仅本窗口编辑；设备同步未实现 | 可编辑 256 字节表，关闭窗口后不保留。「下发到设备」「从设备读回」按钮禁用，固件没有对应命令 |
 | 经典 CAN / CAN FD | 本地演示 | 支持协议切换、BRS、数据段速率和帧长度校验；接收生成示例帧，发送只追加 TX 记录，不发 USB |
 | SPI、LIN、UART、PWM / 频率捕获、GPIO、AD 记录、ADS1015、EEPROM、Flash、UDS | 本地演示 | 侧栏有页面，数据留在本次窗口，不发 USB 命令，也不代表某块芯片或本设备的能力 |
+| UDS Bootloader 真实执行路径 | P1 骨架：宿主 + 离线导入 + **模拟后端** | 按 [方案](docs/uds-bootloader-plugin-proposal.md) P1 实现任务状态、运行快照、事件归档和版本化后端接口；唯一后端是模拟后端，不打开总线、不发 UDS，结果不代表刷写。真实 CAN / ISO-TP / UDS 为 P2，方案 D01–D07 仍待确认。见 [UI_MERGE_NOTES.md](host/crates/gui/UI_MERGE_NOTES.md) |
 | 硬件 I2C 主机自测 `firmware/i2c_proto`（T1.8） | 已上板（无单独日志） | 独立固件，对端是 SDK 从机示例。通过读数写在 [AGENTS.md](AGENTS.md)：`c0ffee18`、写/读成功、0 处不一致、缺席地址为 `status_i2c_no_addr_hit`（2003） |
 | 从机寄存器表 `firmware/slave_proto`（T1.9） | 100 kHz 直连通过；400 kHz **未通过，待重测** | 独立固件，不经 USB。400 kHz 曾在接 10 kΩ 上拉、接线异常期间测试失败，正确接线下尚未重测。记录见 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) |
 | USB 批量吞吐 `firmware/usb_speed` 与 `usb-speed` | 工具已有；本仓库无实测报告，**待上板** | 与 I2C 桥不同固件。两边都使用测试号 VID:PID `1209:0001`，产品字符串分别为 `usb_speed` 和 `usb_i2c` |

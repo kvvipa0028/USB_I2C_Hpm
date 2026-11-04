@@ -1,6 +1,7 @@
 #!/bin/sh
 # Rebuild NotoSansSC-UI.otf: Noto Sans CJK SC Regular cut down to the
-# non-ASCII characters in ../../src, plus CJK punctuation.
+# non-ASCII characters in ../../src and the UDS example packages in
+# ../../fixtures, plus CJK punctuation.
 # Rerun after adding Chinese text to the window; `cargo test -p usb-i2c-gui`
 # fails until the subset covers it.
 #
@@ -16,7 +17,7 @@ FONT_NUMBER=${FONT_NUMBER:-2}
 
 chars=$(mktemp)
 trap 'rm -f "$chars"' EXIT
-find ../../src -name '*.rs' -exec cat {} + |
+find ../../src ../../fixtures \( -name '*.rs' -o -name '*.udsmock' \) -exec cat {} + |
     python3 -I -c 'import sys
 s = set(c for c in sys.stdin.read() if ord(c) > 127)
 s |= set("，。、：；！？（）「」『』《》【】—…·　")

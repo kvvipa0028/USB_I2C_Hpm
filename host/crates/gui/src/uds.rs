@@ -4,6 +4,13 @@
 //! demo CAN frames its services would exchange (session, security access,
 //! erase, download, check, reset). The report keeps the result and the
 //! config as it was before the run. Nothing goes over USB.
+//!
+//! A second view, 真实执行路径（骨架）, is the P1 host path in `sim`: offline
+//! import, explicit entry choice, a locked plan, and a run on the simulated
+//! backend of `crate::flow`. It never touches the 页面演示 task here, and
+//! nothing it shows counts as a flash.
+
+mod sim;
 
 use std::time::Duration;
 
@@ -220,6 +227,20 @@ struct Report {
     ended: Duration,
 }
 
+/// Which half of the page is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    /// The click-through demo with preset frames.
+    Demo,
+    /// The host path on the simulated backend.
+    Sim,
+}
+
+const VIEWS: [(View, &str); 2] = [
+    (View::Demo, "页面演示"),
+    (View::Sim, "真实执行路径（骨架 · 模拟执行，非真实刷写）"),
+];
+
 pub struct Uds {
     cfg: Config,
     saved: Saved<Config>,
@@ -232,6 +253,8 @@ pub struct Uds {
     snapshot: bool,
     services: bool,
     refused: Vec<String>,
+    view: View,
+    sim: sim::Sim,
 }
 
 impl Default for Uds {
@@ -248,6 +271,8 @@ impl Default for Uds {
             snapshot: true,
             services: false,
             refused: Vec::new(),
+            view: View::Demo,
+            sim: sim::Sim::default(),
         }
     }
 }
@@ -255,6 +280,19 @@ impl Default for Uds {
 impl Uds {
     pub fn running(&self) -> bool {
         job::is_running(&self.task)
+    }
+
+    /// Move the simulated run on to `now`; true while it or the demo task
+    /// is going. Called every frame, whichever page is open.
+    pub fn tick(&mut self, now: Duration) -> bool {
+        let sim = self.sim.tick(now);
+        sim || self.running()
+    }
+
+    /// The simulated run moves on time and needs frames; the demo task
+    /// moves on clicks.
+    pub fn timed(&self) -> bool {
+        self.sim.active()
     }
 
     fn start(&mut self, now: Duration) {
@@ -302,6 +340,23 @@ impl Uds {
 }
 
 pub fn page(ui: &mut egui::Ui, u: &mut Uds, now: Duration) {
+    if u.view == View::Sim {
+        widgets::page_head(
+            ui,
+            "UDS Bootloader 升级",
+            Some(sim::badge(&u.sim)),
+            "离线导入 → 选择入口 → 锁定运行计划 → 模拟后端事件。模拟执行，非真实刷写；不经 USB，不发 UDS 请求。",
+            |_| {},
+        );
+        ui.add_space(4.0);
+        widgets::seg(ui, &mut u.view, &VIEWS);
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("uds_sim")
+            .auto_shrink([false, false])
+            .show(ui, |ui| sim::view(ui, &mut u.sim, now));
+        return;
+    }
     widgets::page_head(
         ui,
         "UDS Bootloader 升级",
@@ -319,6 +374,8 @@ pub fn page(ui: &mut egui::Ui, u: &mut Uds, now: Duration) {
         },
     );
     ui.add_space(4.0);
+    widgets::seg(ui, &mut u.view, &VIEWS);
+    ui.add_space(8.0);
     job::step_bar(ui, &mut u.step, u.task.as_ref());
     ui.add_space(10.0);
     egui::ScrollArea::vertical()
@@ -683,5 +740,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_demo_stays_the_default_and_on_clicks() {
+        let mut u = Uds::default();
+        assert_eq!(u.view, View::Demo);
+        assert!(!u.tick(Duration::ZERO));
+        u.start(Duration::ZERO);
+        // the demo task counts as running but asks for no timed frames
+        assert!(u.tick(Duration::from_secs(5)));
+        assert!(!u.timed());
+        assert_eq!(u.task.as_ref().unwrap().done, 0);
     }
 }

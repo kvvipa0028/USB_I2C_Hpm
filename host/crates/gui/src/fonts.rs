@@ -1,7 +1,8 @@
 //! Built-in Chinese UI font.
 //!
 //! `assets/fonts/NotoSansSC-UI.otf` is Noto Sans CJK SC Regular (SIL OFL 1.1,
-//! `assets/fonts/OFL.txt`) cut down to the characters in `src/` by
+//! `assets/fonts/OFL.txt`) cut down to the characters in `src/` and the
+//! example packages in `fixtures/` by
 //! `assets/fonts/subset.sh`, so the window's Chinese looks the same on every
 //! machine without shipping the full 16 MB font. It comes after egui's own
 //! fonts, so Latin text and digits keep egui's look. Characters outside the
@@ -46,7 +47,10 @@ mod tests {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
+            } else if path
+                .extension()
+                .is_some_and(|e| e == "rs" || e == "udsmock")
+            {
                 let text = std::fs::read_to_string(&path).unwrap();
                 out.push((path.display().to_string(), text));
             }
@@ -72,10 +76,10 @@ mod tests {
         assert!(!fonts.has_glyph(&font, '\u{9f98}'));
 
         let mut files = Vec::new();
-        sources(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // the UDS example packages are shown in the window too
+        sources(&root.join("src"), &mut files);
+        sources(&root.join("fixtures"), &mut files);
         let mut missing = String::new();
         for (file, text) in &files {
             for c in text.chars().filter(|c| !c.is_ascii()) {

@@ -1,0 +1,41 @@
+# 模拟流程包示例：三个入口，必须明确选择一个，不会默认执行第一个。
+# cal 演示校验失败（失败），lost 演示下载中后端失联（结果未知）。
+# 格式说明见同目录 README.md；运行结果均为模拟，不代表刷写。
+format = uds-mock-fixture
+version = 1
+package = 演示包 · 多入口
+files = app.bin, cal.bin, flash_driver.bin
+
+[entry app]
+title = 应用程序刷写（模拟）
+ecu = DEMO-ECU-A
+image = app.bin | 0x00010000 | 262144
+needs = flash_driver.bin
+param = p2 | 响应超时 P2 | ms | 1..5000 | 50
+step = session | 进入编程会话
+step = security | 安全访问
+step = erase | 擦除下载区域
+step = download | 分块下载应用程序
+step = verify | ECU 完整性校验
+step = reset | 复位
+
+[entry cal]
+title = 标定数据刷写 · 校验失败演示（模拟）
+ecu = DEMO-ECU-A
+image = cal.bin | 0x00080000 | 32768
+step = session | 进入编程会话
+step = security | 安全访问
+step = erase | 擦除标定区
+step = download | 下载标定数据
+step = verify | 标定完整性校验
+simulate = fail@verify
+
+[entry lost]
+title = 应用程序刷写 · 后端失联演示（模拟）
+ecu = DEMO-ECU-B
+image = app.bin | 0x00010000 | 262144
+step = session | 进入编程会话
+step = erase | 擦除下载区域
+step = download | 分块下载应用程序
+step = verify | ECU 完整性校验
+simulate = lost@download
