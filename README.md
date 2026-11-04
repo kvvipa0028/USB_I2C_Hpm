@@ -13,14 +13,18 @@
 | USB 桥固件 `firmware/usb_i2c` | 原型。快乐路径有一次台上记录；电脑端恢复路径**待上板** | 只做 I2C0 主机、100 kHz。提交 `ac4e73e` 的说明记载：EVK 桥与 EVKMini 寄存器表从机做过 PING、写、重复 START 读、缺席地址 NACK。仓库无该次原始日志。其后 GUI（PR #1、#2）与单桥恢复（PR #3）未再上板 |
 | 电脑端库与 CLI `usb-i2c` | 代码已有。会话失效与重连行为**待上板** | `list` / `ping` / `write` / `read` / `wr`。超时或损坏回复使会话失效，不自动重试 |
 | GUI `usb-i2c-gui` | 界面已合入（BusStudio 全模块页）。实机连接与 I2C **待上板** | 设备连接发 `CMD_PING`；I2C 主机的写入、读取、写后读（及同一笔循环）发 `CMD_I2C` |
-| I2C 扫描、总线恢复、从机寄存器表下发 | 本地演示 | 固件没有这些命令。扫描和总线恢复只往事务表插标「演示」的行；从机页在本窗口编辑 256 字节表 |
-| SPI、CAN、LIN、UART、PWM / 频率捕获、GPIO、AD 记录、ADS1015、EEPROM、Flash、UDS | 本地演示 | 侧栏有页面，数据留在本次窗口，不发明 USB 命令，也不代表某块芯片或本设备的能力 |
+| I2C 扫描、总线恢复 | 本地演示 | 固件没有这些命令。按钮只往事务表插入标「演示」的示例行 |
+| I2C 从机寄存器表 | 仅本窗口编辑；设备同步未实现 | 可编辑 256 字节表，关闭窗口后不保留。「下发到设备」「从设备读回」按钮禁用，固件没有对应命令 |
+| 经典 CAN / CAN FD | 本地演示 | 支持协议切换、BRS、数据段速率和帧长度校验；接收生成示例帧，发送只追加 TX 记录，不发 USB |
+| SPI、LIN、UART、PWM / 频率捕获、GPIO、AD 记录、ADS1015、EEPROM、Flash、UDS | 本地演示 | 侧栏有页面，数据留在本次窗口，不发 USB 命令，也不代表某块芯片或本设备的能力 |
 | 硬件 I2C 主机自测 `firmware/i2c_proto`（T1.8） | 已上板（无单独日志） | 独立固件，对端是 SDK 从机示例。通过读数写在 [AGENTS.md](AGENTS.md)：`c0ffee18`、写/读成功、0 处不一致、缺席地址为 `status_i2c_no_addr_hit`（2003） |
-| 从机寄存器表 `firmware/slave_proto`（T1.9） | 100 kHz 直连已上板；400 kHz **待上板** | 独立固件，不经 USB。记录见 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) |
+| 从机寄存器表 `firmware/slave_proto`（T1.9） | 100 kHz 直连通过；400 kHz **未通过，待重测** | 独立固件，不经 USB。400 kHz 曾在接 10 kΩ 上拉、接线异常期间测试失败，正确接线下尚未重测。记录见 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) |
 | USB 批量吞吐 `firmware/usb_speed` 与 `usb-speed` | 工具已有；本仓库无实测报告，**待上板** | 与 I2C 桥不同固件。两边都使用测试号 VID:PID `1209:0001`，产品字符串分别为 `usb_speed` 和 `usb_i2c` |
 | 双端口与角色切换、可调速率、地址扫描与总线恢复命令、上拉与 1.8–5 V、C / Python SDK、固件升级与防克隆 | 规划 | 见 [PRD.md](PRD.md)、[DEV_PLAN.md](DEV_PLAN.md)。仓库里还没有 `docs/usb-protocol.md`、`host/crates/sdk-c`、`sdk-py`、bootloader 或硬件目录 |
 
 「待上板」表示仓库里有对应代码或电脑端测试，但没有实体 HPM6300EVK 上的验收记录。PR #3 的单桥恢复、EEPROM 容量边界和 AD 演示计时只做过电脑端模型测试与界面测试，见 [docs/host-reliability.md](docs/host-reliability.md)。
+
+CAN 页支持标准帧（11 bit）和扩展帧（29 bit）。经典 CAN 数据长度为 0–8 字节；CAN FD 只接受 0–8、12、16、20、24、32、48、64 字节，不自动补齐。启用 CAN FD 的 BRS 后可单独选择数据段速率，关闭 BRS 时使用仲裁速率。这些是本地演示的配置与校验规则，尚无 CAN / CAN FD 固件命令或硬件收发。
 
 ## 仓库结构
 
@@ -32,6 +36,8 @@ LICENSE                     MIT
 功能清单_UTA0301对标.xlsx    对标清单（规划）
 docs/
   host-reliability.md       单桥会话、失败不重试、演示页边界
+  pwm-frequency-capture.md  PWM / 频率捕获合页说明
+  images/                   PWM / 频率捕获浅色与深色预览图
   T1.9-slave-test.md        从机寄存器表上板记录
   T1.9-data/                上述测试的 OpenOCD 原文
 firmware/                   目标板 HPM6300EVK（HPM6360），一次烧录一份
@@ -55,9 +61,11 @@ HPM SDK、RISC-V GCC 和 OpenOCD 在仓库外，默认放在 `~/hpm/`。
 
 ## 构建与运行
 
-### 主机（Linux）
+### 主机（macOS / Linux）
 
-在 `host/` 下执行。依赖以 `Cargo.lock` 为准，请带 `--locked`。GUI 使用 egui 0.37，需要 Rust 1.95 或更新的 stable，以及图形环境。
+从仓库根目录开始，执行 `cd host` 后，本节后续命令均在 `host/` 下运行。依赖以 `Cargo.lock` 为准，请带 `--locked`。GUI 使用 egui 0.37，需要 Rust 1.95 或更新的 stable，以及图形环境。
+
+macOS 还需安装 Xcode Command Line Tools（`xcode-select --install`）。主机程序使用本机 Rust 工具链；HPM SDK 和 RISC-V 工具链只用于后面的固件构建。
 
 ```sh
 cd host
@@ -73,6 +81,8 @@ cargo run --release --locked -p usb-i2c-gui
 ./target/release/usb-i2c-gui
 ```
 
+macOS 上的构建产物同样是 `target/release/usb-i2c-gui` 可执行文件。仓库尚未提供 `.app` 打包脚本或 macOS 安装包，手工生成的 `.app` 不属于仓库发布产物。
+
 桥接器命令行（板子需已烧录 `firmware/usb_i2c`，产品字符串 `usb_i2c`）：
 
 ```sh
@@ -82,6 +92,8 @@ cargo run --release --locked -p usb-i2c-gui
 ./target/release/usb-i2c read 0x50 16
 ./target/release/usb-i2c wr 0x50 16 00
 ```
+
+这里的 `0x50` 是示例 7 位从机地址，长度 `16` 为十进制，数据字节按十六进制解析。写入示例按寄存器表从机的约定，以 `00` 为偏移；`wr 0x50 16 00` 表示先写偏移 `0x00`，再重复 START 读取 16 字节。实际使用时按目标器件协议调整地址和数据；`read` 是直接读，不先写寄存器地址。
 
 吞吐工具配合已烧录 `firmware/usb_speed` 的板子：
 
@@ -101,12 +113,11 @@ cargo clippy -p usb-i2c -p usb-i2c-gui --all-targets --locked -- -D warnings
 
 ### 主机（Windows）
 
-在已安装 Rust 与 MSVC 目标的 Windows 上，使用同一组 `cargo build` / `cargo test` / `cargo run` 命令。Release 图形程序是 `target\release\usb-i2c-gui.exe`（无控制台窗口）。
+在已安装 Rust 与 MSVC 目标的 Windows 上，进入仓库的 `host/` 目录，使用同一组 `cargo build` / `cargo test` / `cargo run` 命令。Release 图形程序是 `target\release\usb-i2c-gui.exe`（无控制台窗口）。
 
-从 Linux 做的 Windows 检查只编译、不运行：
+从 Linux 做的 Windows 检查只编译、不运行。安装对应 Rust target 后，在 `host/` 下执行：
 
 ```sh
-cd host
 cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
 ```
 
@@ -114,13 +125,15 @@ cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
 
 ### 固件
 
-先准备仓库外的 HPM SDK v1.13.0、`riscv32-unknown-elf-gcc` 和 HPM 版 OpenOCD，再：
+本节所有命令均在**仓库根目录**执行。若接着主机章节操作且当前仍在 `host/`，先执行 `cd ..` 返回根目录。
+
+先准备 CMake、Ninja，以及仓库外的 HPM SDK v1.13.0、`riscv32-unknown-elf-gcc` 和 HPM 版 OpenOCD，再：
 
 ```sh
 source tools/env.sh
 ```
 
-`tools/env.sh` 的默认工具链路径是 macOS Intel 构建。在 Linux 上先导出 `HPM_SDK_BASE` 和 `GNURISCV_TOOLCHAIN_PATH`，再 source。需要计时或吞吐时给 CMake 加上 `-DCMAKE_BUILD_TYPE=release`，否则 SDK 按 `-O0` 编译。
+`tools/env.sh` 的默认工具链路径是 macOS Intel 构建，本机通过 Rosetta 运行，外部动态库路径约束见 [AGENTS.md](AGENTS.md)。在 Linux 上先导出 `HPM_SDK_BASE` 和 `GNURISCV_TOOLCHAIN_PATH`，OpenOCD 路径不同时再设置 `HPM_OPENOCD_BIN`，然后 source。需要计时或吞吐时给 CMake 加上 `-DCMAKE_BUILD_TYPE=release`，否则 SDK 按 `-O0` 编译。
 
 与当前主机关联的是 USB 桥：
 
@@ -132,6 +145,18 @@ tools/flash.sh firmware/usb_i2c/build/output/demo.elf
 ```
 
 `tools/flash.sh` 走板载 FT2232。两块板同时连接时，按 [AGENTS.md](AGENTS.md) 用 USB location 区分；文档里的 `32-2.4` / `32-2.1.4` 只对当时的接线有效。T1.8、T1.9 和 `usb_speed` 的构建命令也在该文件。T1.9 的 `SLV_MODE` 与对端 `BUS_MODE` 必须一致，通过判据以 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) 为准。
+
+## 首次使用
+
+浏览本地演示页面只需构建并运行 `usb-i2c-gui`，不要求连接硬件。进行真实 I2C 传输前，先完成主机程序构建，再按以下顺序准备：
+
+1. 按固件章节构建 `firmware/usb_i2c`，通过板载 FT2232 烧录到 HPM6300EVK。
+2. 使用连接 HPM6360 **USB0** 的板载 USB 接口，通过数据线接到电脑。FT2232 用于烧录和调试，仅连接该接口不会枚举出 `usb_i2c` 桥。
+3. 接好 I2C0 与目标从机：EVK **J28[13] 为 SCL、J28[15] 为 SDA**，两端共地，并确认目标供电、逻辑电平和上拉接法匹配。当前桥固定 100 kHz。两板引脚与已测接线可参考 [T1.9 测试记录](docs/T1.9-slave-test.md)；该记录使用独立测试固件。
+4. 在 `host/` 下执行 `./target/release/usb-i2c list`，确认列出桥设备，再执行 `./target/release/usb-i2c ping` 检查协议版本和固件标识。PING 成功只证明 USB 桥可通信，不代表 I2C 从机已应答。
+5. 启动 GUI，刷新并连接设备，在 I2C 主机页填写目标的 7 位地址和数据，先执行单次读写。使用 CLI 时先断开 GUI 的设备连接，避免同时占用同一 USB 接口。
+
+若 `list` 没有设备，先核对 USB0 数据线与固件类型：主机同时匹配 VID:PID `1209:0001` 和产品字符串 `usb_i2c`，`usb_speed` 固件不会出现在桥设备列表中。若设备已列出但无法打开，检查接口是否被其他进程占用，以及当前用户的 USB 访问权限。若 PING 成功而 I2C 返回 NACK，再检查从机地址、供电和 SCL / SDA 接线。
 
 ## 协议与安全边界
 
