@@ -185,7 +185,7 @@ impl Harness {
 
     fn frame(&mut self, c: &mut Can, events: Vec<egui::Event>) {
         self.time += 0.02;
-        let out = self.ctx.run_ui(
+        let mut out = self.ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                 focused: true,
@@ -202,6 +202,7 @@ impl Harness {
                 });
             },
         );
+        out.textures_delta.clear();
         self.texts.clear();
         for shape in &out.shapes {
             self.collect(&shape.shape, shape.clip_rect);

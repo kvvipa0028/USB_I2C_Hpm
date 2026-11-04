@@ -1,0 +1,19 @@
+# 模拟流程包示例：含缺失依赖和不支持项，检查后阻止准备与启动。
+# flash_driver.bin 不在 files 中（缺少依赖）；requires、script 和
+# checksum_vendor 步骤模拟后端都不支持。离线检查只记录脚本，不运行。
+format = uds-mock-fixture
+version = 1
+package = 演示包 · 含不支持项
+files = app.bin
+
+[entry app]
+title = 应用程序刷写（含厂家扩展）
+ecu = DEMO-ECU-C
+image = app.bin | 0x00010000 | 262144
+needs = flash_driver.bin
+requires = otx-extension:com.example.SecureFlash
+script = post_flash.js
+step = session | 进入编程会话
+step = security | 安全访问
+step = checksum_vendor | 厂家专用校验
+step = download | 分块下载应用程序

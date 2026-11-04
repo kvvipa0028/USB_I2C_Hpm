@@ -16,6 +16,7 @@ mod chart;
 mod device;
 mod eeprom;
 mod flash;
+mod flow;
 mod fonts;
 mod frame;
 mod gpio;

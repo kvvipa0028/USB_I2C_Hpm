@@ -1,0 +1,24 @@
+# 模拟流程包示例：单入口，全部项目受模拟后端支持。
+# 格式说明见同目录 README.md。这不是 ODX / PDX / OTX 或厂家格式，
+# 只供 P1 宿主与模拟后端演示；运行结果均为模拟，不代表刷写。
+format = uds-mock-fixture
+version = 1
+package = 演示包 · 单入口
+files = app.bin, flash_driver.bin
+
+[entry app]
+title = 应用程序刷写（模拟）
+ecu = DEMO-ECU-A · 演示 Bootloader
+image = app.bin | 0x00010000 | 262144
+needs = flash_driver.bin
+const = req_id | 请求 ID | 0x7E0
+const = resp_id | 响应 ID | 0x7E8
+param = p2 | 响应超时 P2 | ms | 1..5000 | 50
+param = p2x | 扩展超时 P2* | ms | 100..60000 | 5000
+step = read_id | 读取 ECU 标识
+step = session | 进入编程会话
+step = security | 安全访问
+step = erase | 擦除下载区域
+step = download | 分块下载应用程序
+step = verify | ECU 完整性校验
+step = reset | 复位
