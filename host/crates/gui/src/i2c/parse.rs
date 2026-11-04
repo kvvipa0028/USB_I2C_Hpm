@@ -1,4 +1,7 @@
-//! Text fields to bytes, with the same rules as the CLI.
+//! Text fields to bytes, with the same rules as the CLI, and the hex and
+//! time formats the logs use.
+
+use std::time::Duration;
 
 use usb_i2c::proto::MAX_XFER;
 
@@ -53,6 +56,27 @@ pub fn to_hex(data: &[u8]) -> String {
     hex.join(" ")
 }
 
+/// First bytes as hex, with an ellipsis when there are more.
+pub fn preview(data: &[u8]) -> String {
+    const N: usize = 12;
+    if data.len() > N {
+        format!("{} …", to_hex(&data[..N]))
+    } else {
+        to_hex(data)
+    }
+}
+
+/// `mm:ss.mmm` since the window opened.
+pub fn clock(d: Duration) -> String {
+    let ms = d.as_millis();
+    format!(
+        "{:02}:{:02}.{:03}",
+        ms / 60_000,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
+
 /// Short form of a bridge error for a table cell; the full text goes in the tooltip.
 pub fn short_error(e: &str) -> &'static str {
     if e.contains("Nack") {
@@ -98,6 +122,13 @@ mod tests {
             parse_bytes(&to_hex(&[0, 0x7f, 0xff])).unwrap(),
             vec![0, 0x7f, 0xff]
         );
+    }
+
+    #[test]
+    fn log_formats() {
+        assert_eq!(clock(Duration::from_millis(61_234)), "01:01.234");
+        assert_eq!(preview(&[0; 13]).matches("00").count(), 12);
+        assert_eq!(preview(&[1, 2]), "01 02");
     }
 
     #[test]

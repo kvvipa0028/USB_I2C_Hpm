@@ -1,7 +1,8 @@
-//! 从机 tab: role and address, and the 256-byte register table as a hex grid.
-//! Nothing here reaches the device. The bridge has no slave commands yet
-//! (set role, set address, read/write the table), so the table is a local
-//! draft that starts all zero, as slave_proto's table does after reset.
+//! 从机 tab: address, and the 256-byte register table as a hex grid.
+//! Nothing here reaches the device: the bridge protocol has no slave
+//! commands (set role, set address, read/write the table), so the table is
+//! edited in the window and starts all zero, as slave_proto's does after
+//! reset.
 
 use eframe::egui;
 
@@ -86,7 +87,26 @@ impl Slave {
 }
 
 pub fn show(ui: &mut egui::Ui, s: &mut Slave) {
-    widgets::work_columns(ui, s, 264.0, 820.0, config, table);
+    widgets::work_columns(ui, s, 264.0, 820.0, config, |ui, s| {
+        summary(ui, s);
+        ui.add_space(12.0);
+        table(ui, s);
+    });
+}
+
+fn summary(ui: &mut egui::Ui, s: &Slave) {
+    let addr = parse_addr(&s.addr).map_or("—".to_owned(), |a| format!("0x{a:02x}"));
+    let nonzero = s.table.iter().filter(|b| **b != 0).count();
+    widgets::summary_strip(
+        ui,
+        &[
+            ("从机地址", addr),
+            ("已改", format!("{} B", s.edited())),
+            ("非零", format!("{nonzero} B")),
+            ("光标", format!("0x{:02X}", s.cursor)),
+        ],
+        "本窗口编辑",
+    );
 }
 
 fn config(ui: &mut egui::Ui, s: &mut Slave) {
@@ -95,19 +115,12 @@ fn config(ui: &mut egui::Ui, s: &mut Slave) {
         ui,
         "从机配置",
         |ui| {
-            widgets::badge(ui, "本地草稿", Tone::Amber);
+            widgets::badge(ui, "I2C0", Tone::Neutral);
         },
         |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             widgets::field_row(ui, "端口", false, |ui| {
                 widgets::fixed_value(ui, "I2C0", FIXED_PORT);
-            });
-            widgets::field_row(ui, "角色", false, |ui| {
-                widgets::fixed_value(
-                    ui,
-                    "从机（未下发）",
-                    "端口按主机/从机切换要等固件支持；当前固件只做主机。",
-                );
             });
             widgets::field_row(ui, "从机地址", false, |ui| {
                 ui.add(
@@ -130,32 +143,25 @@ fn config(ui: &mut egui::Ui, s: &mut Slave) {
             }
         },
     );
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(
-            "主机写入的第 1 个字节是偏移，之后逐字节写入；读取从当前偏移开始，到表尾回到 0。",
-        )
-        .size(11.5)
-        .color(t.muted),
+    ui.add_space(8.0);
+    widgets::note(
+        ui,
+        "主机写入的第 1 个字节是偏移，之后逐字节写入；读取从当前偏移开始，到表尾回到 0。",
     );
     ui.add_space(10.0);
     widgets::panel(
         ui,
         "与设备同步",
-        |ui| {
-            widgets::badge(ui, "待协议", Tone::Amber);
-        },
+        |_| {},
         |ui| {
             ui.horizontal(|ui| {
                 widgets::action_button(ui, false, "下发到设备").on_disabled_hover_text(NO_CMD);
                 widgets::action_button(ui, false, "从设备读回").on_disabled_hover_text(NO_CMD);
             });
             ui.label(
-                egui::RichText::new(
-                    "设置角色、地址和读写寄存器表都需要新的 USB 命令，当前固件还没有。表格只保存在本窗口，关闭即丢失。",
-                )
-                .size(11.5)
-                .color(t.muted),
+                egui::RichText::new("表格保存在本窗口，关闭后不保留。")
+                    .size(11.5)
+                    .color(t.muted),
             );
         },
     );
@@ -169,7 +175,7 @@ fn table(ui: &mut egui::Ui, s: &mut Slave) {
         "寄存器表",
         |ui| {
             let text = if edited > 0 {
-                format!("已改 {edited} 字节 · 未下发")
+                format!("已改 {edited} 字节")
             } else {
                 "未改动".to_owned()
             };
@@ -195,6 +201,7 @@ fn table(ui: &mut egui::Ui, s: &mut Slave) {
                 }
             });
             grid(ui, s);
+            widgets::table_foot(ui, "256 B · 每行 16 B · 改过的格子标色", "0x00 – 0xFF");
             widgets::hairline(ui);
             inspector(ui, s);
         },

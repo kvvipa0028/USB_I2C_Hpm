@@ -1,16 +1,31 @@
 //! The window: top device bar, sidebar, page, and a status footer.
-//! State lives here; pages return what the user asked for and the app turns
-//! it into a worker `Job`.
+//! State lives here; the device and I2C pages return what the user asked
+//! for and the app turns it into a worker `Job`. Every other page (SPI,
+//! PWM, CAN, LIN, UART, GPIO, AD 记录, ADS1015, EEPROM, Flash, UDS) keeps
+//! its state in its own module and never reaches the worker; their demo
+//! generators tick here each frame, whichever page is open.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
 use eframe::egui;
 
+use crate::adc::{self, Adc};
+use crate::ads1015::{self, Ads1015};
+use crate::can::{self, Can};
 use crate::device::{self, Action, Conn, Devices, Link};
+use crate::eeprom::{self, Eeprom};
+use crate::flash::{self, Flash};
+use crate::gpio::{self, Gpio};
 use crate::i2c::{self, I2c};
+use crate::lin::{self, Lin};
+use crate::local;
 use crate::nav::{self, Page};
+use crate::pwm::{self, Pwm};
+use crate::spi::{self, Spi};
 use crate::theme;
+use crate::uart::{self, Uart};
+use crate::uds::{self, Uds};
 use crate::widgets::{self, Footer, Tone};
 use crate::worker::{self, Event, Job, Op};
 
@@ -22,6 +37,9 @@ pub struct App {
     events: Receiver<Event>,
     dev: Devices,
     i2c: I2c,
+    spi: Spi,
+    pwm: Pwm,
+    local: Local,
     page: Page,
     busy: bool,
     /// Serial being connected to.
@@ -43,6 +61,9 @@ impl App {
             events,
             dev: Devices::default(),
             i2c: I2c::default(),
+            spi: Spi::default(),
+            pwm: Pwm::default(),
+            local: Local::default(),
             page: Page::Device,
             busy: true,
             connecting: None,
@@ -195,10 +216,35 @@ impl eframe::App for App {
             self.act(a);
         }
 
+        let now = self.opened.elapsed();
+        if let Some(op) = self
+            .i2c
+            .master
+            .loop_due(now, self.dev.can_send(), self.busy)
+        {
+            self.start_transfer(op);
+        }
+        let mut live = self.local.tick(now);
+        if self.spi.tick(now) {
+            live.push(Page::Spi);
+        }
+        // EEPROM, Flash and UDS step on clicks; only timed demos need frames
+        let timed = live
+            .iter()
+            .any(|p| !matches!(p, Page::Eeprom | Page::Flash | Page::Uds));
+        if timed || self.i2c.master.looping() {
+            ui.ctx().request_repaint_after(local::TICK);
+        }
+
         let link_text = match (&self.dev.conn, link) {
             (Some(c), Link::On | Link::Missing) => format!("{} {}", link.text(), c.serial),
             _ => link.text().to_owned(),
         };
+        let mut right = footer_note(self.page).to_owned();
+        if !live.is_empty() {
+            let names: Vec<&str> = live.iter().map(|p| p.label()).collect();
+            right = format!("{right} · 演示运行中：{}", names.join("、"));
+        }
         egui::Panel::bottom("status_bar")
             .exact_size(28.0)
             .resizable(false)
@@ -211,7 +257,7 @@ impl eframe::App for App {
                         link_text: &link_text,
                         busy: self.busy,
                         result: Some((&self.status, self.tone)),
-                        right: "I2C0 · 100 kHz（固件固定）",
+                        right: &right,
                     },
                 )
             });
@@ -221,13 +267,15 @@ impl eframe::App for App {
             .resizable(false)
             .frame(bar(10, 14))
             .show(ui, |ui| {
-                nav::sidebar(ui, &mut self.page, link.tone().dot(&t))
+                nav::sidebar(ui, &mut self.page, link.tone().dot(&t), &live)
             });
 
         let cx = i2c::Ctx {
             connected: self.dev.can_send(),
             busy: self.busy,
+            now,
         };
+        let l = &mut self.local;
         let request = egui::CentralPanel::default()
             .frame(bar(20, 16))
             .show(ui, |ui| {
@@ -241,8 +289,48 @@ impl eframe::App for App {
                     )
                     .map(Request::Device),
                     Page::I2c => i2c::page(ui, &mut self.i2c, cx).map(Request::I2c),
-                    Page::Spi | Page::Pwm => {
-                        placeholder_page(ui, self.page.label());
+                    Page::Spi => {
+                        spi::page(ui, &mut self.spi, now);
+                        None
+                    }
+                    Page::Pwm => {
+                        pwm::page(ui, &mut self.pwm, now);
+                        None
+                    }
+                    Page::Can => {
+                        can::page(ui, &mut l.can, now);
+                        None
+                    }
+                    Page::Lin => {
+                        lin::page(ui, &mut l.lin, now);
+                        None
+                    }
+                    Page::Uart => {
+                        uart::page(ui, &mut l.uart, now);
+                        None
+                    }
+                    Page::Gpio => {
+                        gpio::page(ui, &mut l.gpio, now);
+                        None
+                    }
+                    Page::Adc => {
+                        adc::page(ui, &mut l.adc, now);
+                        None
+                    }
+                    Page::Ads1015 => {
+                        ads1015::page(ui, &mut l.ads1015, now);
+                        None
+                    }
+                    Page::Eeprom => {
+                        eeprom::page(ui, &mut l.eeprom, now);
+                        None
+                    }
+                    Page::Flash => {
+                        flash::page(ui, &mut l.flash, now);
+                        None
+                    }
+                    Page::Uds => {
+                        uds::page(ui, &mut l.uds, now);
                         None
                     }
                 })
@@ -261,19 +349,58 @@ enum Request {
     I2c(Op),
 }
 
-fn placeholder_page(ui: &mut egui::Ui, name: &str) {
-    widgets::page_head(
-        ui,
-        name,
-        Some(("未实现", Tone::Neutral)),
-        "当前固件只实现了 I2C，这里还没有命令。",
-        |_| {},
-    );
-    widgets::section(ui, "说明", |ui| {
-        ui.label(format!(
-            "{name} 属于第二批功能，需要新的固件和 USB 命令。入口先留在侧栏，固件支持后在这里接入。"
-        ));
-    });
+/// The pages that run in the window only and never reach the worker.
+#[derive(Default)]
+struct Local {
+    can: Can,
+    lin: Lin,
+    uart: Uart,
+    gpio: Gpio,
+    adc: Adc,
+    ads1015: Ads1015,
+    eeprom: Eeprom,
+    flash: Flash,
+    uds: Uds,
+}
+
+impl Local {
+    /// Advance every demo generator to `now`; returns the pages still running.
+    fn tick(&mut self, now: std::time::Duration) -> Vec<Page> {
+        let mut live = Vec::new();
+        for (running, page) in [
+            (self.can.tick(now), Page::Can),
+            (self.lin.tick(now), Page::Lin),
+            (self.uart.tick(now), Page::Uart),
+            (self.adc.tick(now), Page::Adc),
+            (self.ads1015.tick(now), Page::Ads1015),
+            (self.eeprom.running(), Page::Eeprom),
+            (self.flash.running(), Page::Flash),
+            (self.uds.running(), Page::Uds),
+        ] {
+            if running {
+                live.push(page);
+            }
+        }
+        live
+    }
+}
+
+/// Right end of the footer: what the open page is wired to.
+fn footer_note(page: Page) -> &'static str {
+    match page {
+        Page::Device | Page::I2c => "I2C0 · 100 kHz（固件固定）",
+        Page::Spi => "SPI · 本地会话",
+        Page::Pwm => "PWM · 配置预览",
+        Page::Can => "CAN · 本地演示，未接线",
+        Page::Lin => "LIN · 本地演示，未接线",
+        Page::Uart => "UART · 本地回显，未接线",
+        Page::Gpio => "GPIO · 模拟电平",
+        Page::Adc => "AD · 模拟波形",
+        Page::Ads1015 => "ADS1015 · 模拟数据，不发 I2C",
+        Page::Eeprom => "EEPROM · 演示镜像",
+        Page::Flash => "Flash · 演示镜像",
+        Page::Uds => "UDS · 演示流程",
+    }
 }
 
 /// Some window managers ignore the initial size; widen the first frame if so.
