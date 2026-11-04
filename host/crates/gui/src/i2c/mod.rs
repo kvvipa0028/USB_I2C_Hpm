@@ -1,12 +1,14 @@
 //! I2C workbench: 主机 and 从机 tabs.
-//! 主机 runs on the bridge's one I2C command (write, read, write-then-read).
-//! Scan, bus recovery, and 从机's sync buttons are shown switched off with a
-//! short hover; the protocol has no commands for them. The 从机 table is
-//! edited in the window only.
+//! 主机 runs on the bridge's one I2C command (write, read, write-then-read,
+//! once or on a loop). Scan and bus recovery have no command: they insert
+//! rows marked 演示. 从机's sync buttons are shown switched off with a short
+//! hover; the 从机 table is edited in the window only.
 
 mod master;
 pub mod parse;
 mod slave;
+
+use std::time::Duration;
 
 use eframe::egui;
 
@@ -26,6 +28,8 @@ pub enum Tab {
 pub struct Ctx {
     pub connected: bool,
     pub busy: bool,
+    /// Since the window opened.
+    pub now: Duration,
 }
 
 pub struct I2c {
@@ -58,10 +62,16 @@ pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Op> {
         ("未连接", Tone::Neutral)
     };
     let subtitle = match st.tab {
-        Tab::Master => "写入、读取、写后读。速率固件固定 100 kHz，单次最多 256 字节。",
+        Tab::Master => {
+            "写入、读取、写后读，可按周期循环。速率固件固定 100 kHz，单次最多 256 字节。"
+        }
         Tab::Slave => "EEPROM 式寄存器表，256 字节、1 字节偏移，在本窗口编辑。",
     };
     widgets::page_head(ui, "I2C", Some(badge), subtitle, |ui| {
+        if st.tab == Tab::Master {
+            master::save_button(ui, &mut st.master, cx.now);
+            ui.add_space(6.0);
+        }
         widgets::seg(
             ui,
             &mut st.tab,

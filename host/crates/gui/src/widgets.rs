@@ -779,3 +779,261 @@ pub fn work_columns<S, R>(
     })
     .inner
 }
+
+/// Square check box with its label; ink when on (Magpie switches are ink,
+/// not accent).
+pub fn check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let t = theme::of(ui);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(12.0), t.fg2);
+    let size = egui::vec2(22.0 + galley.size().x, 22.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let bx = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 7.0, rect.center().y),
+        egui::vec2(14.0, 14.0),
+    );
+    let radius = egui::CornerRadius::same(4);
+    let p = ui.painter();
+    if *on {
+        p.rect_filled(bx, radius, t.ink);
+        let c = bx.center();
+        let s = egui::Stroke::new(1.6, t.ink_fg);
+        p.line_segment([c + egui::vec2(-3.5, 0.0), c + egui::vec2(-1.0, 2.5)], s);
+        p.line_segment([c + egui::vec2(-1.0, 2.5), c + egui::vec2(3.5, -2.5)], s);
+    } else {
+        let edge = if resp.hovered() { t.muted } else { t.faint };
+        p.rect_filled(bx, radius, t.card);
+        p.rect_stroke(
+            bx,
+            radius,
+            egui::Stroke::new(1.0, edge),
+            egui::StrokeKind::Inside,
+        );
+    }
+    p.galley(
+        egui::pos2(bx.right() + 7.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        t.fg2,
+    );
+    resp
+}
+
+/// Detail row: the key on the left, the value right-aligned in monospace.
+pub fn kv(ui: &mut egui::Ui, key: &str, value: &str, color: egui::Color32, last: bool) {
+    let t = theme::of(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        key,
+        egui::FontId::proportional(12.0),
+        t.muted,
+    );
+    ui.painter().text(
+        rect.right_center(),
+        egui::Align2::RIGHT_CENTER,
+        value,
+        egui::FontId::monospace(11.5),
+        color,
+    );
+    if !last {
+        hairline(ui);
+    }
+}
+
+/// BusStudio's step bar (配置与检查 → 执行任务 → 验证与报告). `current` is
+/// marked; steps up to `reachable` can be clicked. Returns the clicked step.
+pub fn steps(
+    ui: &mut egui::Ui,
+    labels: &[&str],
+    current: usize,
+    reachable: usize,
+) -> Option<usize> {
+    let t = theme::of(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+    let p = ui.painter().clone();
+    let radius = egui::CornerRadius::same(10);
+    p.rect_filled(rect, radius, t.card);
+    p.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, t.line),
+        egui::StrokeKind::Inside,
+    );
+    let w = rect.width() / labels.len().max(1) as f32;
+    let mut out = None;
+    for (i, label) in labels.iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + i as f32 * w, rect.top()),
+            egui::vec2(w, rect.height()),
+        );
+        let open = i <= reachable;
+        let sense = if open {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let resp = ui.interact(cell, ui.make_persistent_id(("step", i)), sense);
+        let on = i == current;
+        if on {
+            p.rect_filled(cell.shrink(3.0), egui::CornerRadius::same(8), t.sel);
+        } else if open && resp.hovered() {
+            p.rect_filled(cell.shrink(3.0), egui::CornerRadius::same(8), t.card2);
+        }
+        if i > 0 {
+            p.vline(
+                cell.left(),
+                cell.top() + 10.0..=cell.bottom() - 10.0,
+                egui::Stroke::new(1.0, t.line2),
+            );
+        }
+        let color = if on {
+            t.accent
+        } else if open {
+            t.fg
+        } else {
+            t.muted
+        };
+        let galley = p.layout_no_wrap((*label).to_owned(), egui::FontId::proportional(12.5), color);
+        let x0 = cell.center().x - (28.0 + galley.size().x) / 2.0;
+        let c = egui::pos2(x0 + 10.0, cell.center().y);
+        p.circle_filled(c, 9.5, t.card);
+        p.circle_stroke(
+            c,
+            9.5,
+            egui::Stroke::new(1.0, if on { t.accent } else { t.line }),
+        );
+        p.text(
+            c,
+            egui::Align2::CENTER_CENTER,
+            (i + 1).to_string(),
+            egui::FontId::proportional(11.0),
+            color,
+        );
+        p.galley(
+            egui::pos2(x0 + 28.0, cell.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+        if resp.clicked() {
+            out = Some(i);
+        }
+    }
+    out
+}
+
+/// Thin accent progress bar, `frac` from 0 to 1.
+pub fn progress(ui: &mut egui::Ui, frac: f32) {
+    let t = theme::of(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+    let bar = egui::Rect::from_x_y_ranges(
+        rect.x_range(),
+        rect.center().y - 3.0..=rect.center().y + 3.0,
+    );
+    let radius = egui::CornerRadius::same(3);
+    ui.painter().rect_filled(bar, radius, t.pill_hover);
+    let f = frac.clamp(0.0, 1.0);
+    if f > 0.0 {
+        let done =
+            egui::Rect::from_x_y_ranges(bar.left()..=bar.left() + f * bar.width(), bar.y_range());
+        ui.painter().rect_filled(done, radius, t.accent);
+    }
+}
+
+/// The work area with a fixed-width column on its right (CAN's 报文详情),
+/// both working on `state`; below `stack_below` points of width the side
+/// column goes under the main one.
+pub fn with_side<S, R>(
+    ui: &mut egui::Ui,
+    state: &mut S,
+    side_w: f32,
+    stack_below: f32,
+    main: impl FnOnce(&mut egui::Ui, &mut S) -> R,
+    side: impl FnOnce(&mut egui::Ui, &mut S),
+) -> R {
+    const GAP: f32 = 14.0;
+    if ui.available_width() < stack_below {
+        let r = main(ui, state);
+        ui.add_space(GAP);
+        side(ui, state);
+        return r;
+    }
+    ui.horizontal_top(|ui| {
+        let h = ui.available_height();
+        let w = ui.available_width() - side_w - GAP;
+        let r = ui
+            .allocate_ui_with_layout(
+                egui::vec2(w, h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(w);
+                    main(ui, state)
+                },
+            )
+            .inner;
+        ui.add_space(GAP - ui.spacing().item_spacing.x);
+        ui.allocate_ui_with_layout(
+            egui::vec2(side_w, h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(side_w);
+                side(ui, state);
+            },
+        );
+        r
+    })
+    .inner
+}
+
+/// Muted small text, the most common label on the local pages.
+pub fn muted(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let t = theme::of(ui);
+    ui.label(egui::RichText::new(text).size(11.5).color(t.muted))
+}
+
+/// Red line under a field or a card for input that does not parse.
+pub fn error(ui: &mut egui::Ui, text: &str) {
+    let t = theme::of(ui);
+    ui.label(egui::RichText::new(text).size(11.5).color(t.red));
+}
+
+/// [`panel`] with a segmented control in place of the title, for a card
+/// that switches between views (LIN's 帧监视 / 调度表).
+pub fn tab_panel<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    options: &[(T, &str)],
+    head: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let t = theme::of(ui);
+    card_frame(&t, 0).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    seg(ui, value, options);
+                    trailing(ui, 30.0, head);
+                });
+            });
+        divider(ui, t.line);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 8.0;
+                body(ui);
+            });
+    });
+}

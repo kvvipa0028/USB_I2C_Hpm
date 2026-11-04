@@ -10,6 +10,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::i2c::parse::clock;
+use crate::local::Saved;
 use crate::spi::{micros_text, trim};
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
@@ -165,6 +166,7 @@ struct Record {
 pub struct Pwm {
     draft: Config,
     applied: Option<(Config, Duration)>,
+    saved: Saved<Config>,
     hz: String,
     duty: String,
     delay: String,
@@ -178,6 +180,7 @@ impl Default for Pwm {
         let mut p = Self {
             draft: Config::default(),
             applied: None,
+            saved: Saved::default(),
             hz: String::new(),
             duty: String::new(),
             delay: String::new(),
@@ -192,6 +195,15 @@ impl Default for Pwm {
 impl Pwm {
     fn dirty(&self) -> bool {
         self.applied.is_none_or(|(c, _)| c != self.draft)
+    }
+
+    /// Every number field on screen parses. A field being typed into can
+    /// hold bad text while the draft keeps its last good value; 应用配置
+    /// waits until the text is good again.
+    fn fields_ok(&self) -> bool {
+        parse_hz(&self.hz).is_ok()
+            && parse_duty(&self.duty).is_ok()
+            && (!self.advanced || parse_delay(&self.delay).is_ok())
     }
 
     fn sync_text(&mut self) {
@@ -252,15 +264,24 @@ fn parse_delay(s: &str) -> Result<u32, String> {
 pub fn page(ui: &mut egui::Ui, p: &mut Pwm, now: Duration) {
     widgets::page_head(
         ui,
-        "PWM",
+        "PWM 输出控制",
         Some(("配置预览", Tone::Neutral)),
-        "设置频率与占空比，预览待应用的输出配置。波形为配置示意。",
+        "设置频率与占空比，预览待应用的输出配置。波形为配置示意，不经 USB 输出。",
         |ui| {
-            if widgets::ink_button(ui, p.dirty(), "应用配置").clicked() {
+            let ok = p.fields_ok();
+            if widgets::ink_button(ui, p.dirty() && ok, "应用配置")
+                .on_disabled_hover_text(if ok {
+                    "参数与已应用的相同"
+                } else {
+                    "先修正填写有误的参数"
+                })
+                .clicked()
+            {
                 p.apply(now);
             }
+            p.saved.button(ui, &p.draft, now);
             let changed = p.draft != Config::default();
-            if widgets::action_button(ui, changed, "恢复默认").clicked() {
+            if widgets::quiet_button(ui, changed, "恢复默认").clicked() {
                 p.draft = Config::default();
                 p.sync_text();
             }
@@ -392,7 +413,10 @@ fn config(ui: &mut egui::Ui, p: &mut Pwm) {
         },
     );
     ui.add_space(8.0);
-    widgets::note(ui, "波形仅为配置预览，不代表实测输出。");
+    widgets::note(
+        ui,
+        "波形仅为配置预览，不代表实测输出。当前固件没有 PWM 命令，应用配置只记入本页。",
+    );
 }
 
 fn summary(ui: &mut egui::Ui, c: &Config) {
@@ -462,7 +486,8 @@ fn preview(ui: &mut egui::Ui, p: &mut Pwm) {
                 Some((c, _)) => format!("已应用：{}", c.short()),
                 None => "尚未应用".to_owned(),
             };
-            widgets::table_foot(ui, "拖动滑杆或填写占空比，预览随即更新", &applied);
+            widgets::table_foot(ui, "滑杆仅改变配置预览，应用后生效", &applied);
+            widgets::muted(ui, "启动延时与停止状态只记入配置，方波示意不含这两项。");
         },
     );
 }
@@ -635,6 +660,20 @@ mod tests {
         assert_eq!(parse_duty("12.34%"), Ok(12.3));
         assert!(parse_duty("101").is_err());
         assert!(parse_delay("60001").is_err());
+    }
+
+    #[test]
+    fn bad_text_blocks_apply() {
+        let mut p = Pwm::default();
+        assert!(p.fields_ok());
+        p.duty = "12x".into();
+        assert!(!p.fields_ok());
+        p.duty = "12".into();
+        p.delay = "99999".into();
+        // the delay field is hidden until 高级参数 opens
+        assert!(p.fields_ok());
+        p.advanced = true;
+        assert!(!p.fields_ok());
     }
 
     #[test]

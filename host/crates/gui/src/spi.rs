@@ -1,7 +1,7 @@
 //! SPI page. Config on the left; the MOSI composer, the selected
 //! transaction, and this session's log on the right. Runs in the window
-//! only: 执行收发 adds a record to the log and sends nothing over USB, so a
-//! record has no MISO bytes.
+//! only: 执行收发 (once, or each period while 循环 is on) adds a record to
+//! the log and sends nothing over USB, so a record has no MISO bytes.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::i2c::parse::{clock, parse_bytes, preview, to_hex};
+use crate::local::{parse_num, Saved};
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
 
@@ -98,6 +99,7 @@ impl Record {
 
 pub struct Spi {
     cfg: Config,
+    saved: Saved<Config>,
     fill: String,
     advanced: bool,
     mosi: String,
@@ -107,12 +109,18 @@ pub struct Spi {
     log: VecDeque<Record>,
     next_id: u64,
     selected: Option<u64>,
+    /// While set, the log shows records up to this id only.
+    frozen: Option<u64>,
+    looping: bool,
+    period: String,
+    loop_next: Duration,
 }
 
 impl Default for Spi {
     fn default() -> Self {
         Self {
             cfg: Config::default(),
+            saved: Saved::default(),
             fill: "FF".into(),
             advanced: false,
             mosi: "9F FF FF FF".into(),
@@ -120,6 +128,10 @@ impl Default for Spi {
             log: VecDeque::new(),
             next_id: 1,
             selected: None,
+            frozen: None,
+            looping: false,
+            period: "100".into(),
+            loop_next: Duration::ZERO,
         }
     }
 }
@@ -146,13 +158,51 @@ impl Spi {
             padded,
         });
         self.log.truncate(LOG_MAX);
-        self.selected = Some(id);
+        if self.frozen.is_none() {
+            self.selected = Some(id);
+        }
         Ok(())
     }
 
     fn reset(&mut self) {
         self.cfg = Config::default();
-        self.fill = "FF".into();
+        self.sync_fill();
+    }
+
+    fn sync_fill(&mut self) {
+        self.fill = format!("{:02X}", self.cfg.fill);
+    }
+
+    fn loop_period(&self) -> Result<Duration, String> {
+        parse_num(&self.period, 10, 60_000, "循环周期").map(|ms| Duration::from_millis(ms.into()))
+    }
+
+    /// While 循环 is on, run 执行收发 each period; a bad field stops it.
+    /// True while looping.
+    pub fn tick(&mut self, now: Duration) -> bool {
+        if !self.looping {
+            return false;
+        }
+        let period = match self.loop_period() {
+            Ok(p) => p,
+            Err(e) => {
+                self.err = Some(e);
+                self.looping = false;
+                return false;
+            }
+        };
+        if now.saturating_sub(self.loop_next) > Duration::from_secs(2) {
+            self.loop_next = now;
+        }
+        while self.loop_next <= now {
+            if let Err(e) = self.execute(self.loop_next) {
+                self.err = Some(e);
+                self.looping = false;
+                return false;
+            }
+            self.loop_next += period;
+        }
+        true
     }
 
     fn shown(&self) -> Option<&Record> {
@@ -195,14 +245,23 @@ pub fn trim(v: f64, places: usize) -> String {
 }
 
 pub fn page(ui: &mut egui::Ui, s: &mut Spi, now: Duration) {
+    let badge = if s.looping {
+        ("循环中 · 本地", Tone::Green)
+    } else {
+        ("本地会话", Tone::Neutral)
+    };
     widgets::page_head(
         ui,
-        "SPI",
-        Some(("本地会话", Tone::Neutral)),
-        "配置时钟、模式与片选，以 HEX 编写 MOSI；每笔事务记入本次会话。",
+        "SPI 同步收发",
+        Some(badge),
+        "配置时钟、模式与片选，以 HEX 编写 MOSI；每笔事务记入本次会话，不经 USB。",
         |ui| {
+            if widgets::ink_button(ui, true, "执行收发").clicked() {
+                s.err = s.execute(now).err();
+            }
+            s.saved.button(ui, &s.cfg, now);
             let changed = s.cfg != Config::default() || s.fill != "FF";
-            if widgets::action_button(ui, changed, "恢复默认").clicked() {
+            if widgets::quiet_button(ui, changed, "恢复默认").clicked() {
                 s.reset();
             }
         },
@@ -270,13 +329,18 @@ fn config(ui: &mut egui::Ui, s: &mut Spi) {
                 if let Some(e) = fill_err {
                     ui.label(egui::RichText::new(e).size(11.5).color(t.red));
                 }
+            } else {
+                widgets::hairline(ui);
+            }
+            if s.saved.foot(ui, &mut s.cfg) {
+                s.sync_fill();
             }
         },
     );
     ui.add_space(8.0);
     widgets::note(
         ui,
-        "一次事务内片选保持有效，MISO 与 MOSI 等长。16 bit 字长下奇数个字节用填充字节补齐。",
+        "一次事务内片选保持有效。本页只在本地记录 MOSI，不经 USB，没有 MISO 回读字节。16 bit 字长下奇数个字节用填充字节补齐。",
     );
 }
 
@@ -289,7 +353,7 @@ fn summary(ui: &mut egui::Ui, s: &Spi) {
         &[
             ("事务", s.log.len().to_string()),
             ("MOSI 字节", format!("{bytes} B")),
-            ("总线时间", micros_text(us)),
+            ("估算时长", micros_text(us)),
         ],
         "本次会话",
     );
@@ -328,6 +392,13 @@ fn compose(ui: &mut egui::Ui, s: &mut Spi, now: Duration) {
                 if widgets::ink_button(ui, true, "执行收发").clicked() {
                     s.err = s.execute(now).err();
                 }
+                let period = s
+                    .loop_period()
+                    .map_or("循环".into(), |p| format!("循环 · {} ms", p.as_millis()));
+                if widgets::check(ui, &mut s.looping, &period).changed() {
+                    s.loop_next = now;
+                    s.err = None;
+                }
                 widgets::badge(
                     ui,
                     &format!(
@@ -342,6 +413,18 @@ fn compose(ui: &mut egui::Ui, s: &mut Spi, now: Duration) {
                     ui.label(egui::RichText::new(e).size(11.5).color(t.red));
                 }
             });
+            ui.horizontal(|ui| {
+                widgets::muted(ui, "循环周期");
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.period)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(56.0),
+                );
+                widgets::muted(ui, "ms · 只在本页重复记录，不经 USB");
+            });
+            if let Err(e) = s.loop_period() {
+                widgets::error(ui, &e);
+            }
         },
     );
 }
@@ -441,8 +524,20 @@ fn log(ui: &mut egui::Ui, s: &mut Spi) {
                     .color(t.muted),
                 );
                 widgets::trailing(ui, 27.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     if widgets::quiet_button(ui, count > 0, "清空").clicked() {
                         clear = true;
+                    }
+                    let text = if s.frozen.is_some() {
+                        "继续显示"
+                    } else {
+                        "暂停显示"
+                    };
+                    if widgets::quiet_button(ui, true, text).clicked() {
+                        s.frozen = match s.frozen {
+                            Some(_) => None,
+                            None => Some(s.next_id - 1),
+                        };
                     }
                 });
             });
@@ -453,20 +548,30 @@ fn log(ui: &mut egui::Ui, s: &mut Spi) {
             let table = Table {
                 widths: &[84.0, 50.0, 50.0, 0.0, 0.0, 64.0],
             };
-            table.header(ui, &["时间", "片选", "长度", "MOSI", "MISO", "结果"]);
+            table.header(
+                ui,
+                &[
+                    "时间",
+                    "片选",
+                    "长度",
+                    "MOSI / HEX",
+                    "MISO（无回读）",
+                    "结果",
+                ],
+            );
             egui::ScrollArea::vertical()
                 .id_salt("spi_log")
                 .max_height(260.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    for r in &s.log {
+                    for r in s.log.iter().filter(|r| s.frozen.is_none_or(|f| r.id <= f)) {
                         let cells = [
                             (clock(r.at), t.muted, true),
                             (label(&CHIP_SELECTS, r.cfg.cs).to_owned(), t.fg, true),
                             (r.mosi.len().to_string(), t.fg, true),
                             (preview(&r.mosi), t.fg2, true),
-                            ("—".to_owned(), t.faint, true),
+                            ("无回读".to_owned(), t.faint, false),
                             ("本地".to_owned(), t.muted, false),
                         ];
                         if table.row(ui, &cells, s.selected == Some(r.id)).clicked() {
@@ -474,12 +579,18 @@ fn log(ui: &mut egui::Ui, s: &mut Spi) {
                         }
                     }
                 });
-            widgets::table_foot(ui, "最新在上 · 点行查看详情", &format!("最多 {LOG_MAX} 条"));
+            let left = if s.frozen.is_some() {
+                format!("已暂停显示 · 共 {count} 条，记录照常追加")
+            } else {
+                "最新在上 · 点行查看详情".to_owned()
+            };
+            widgets::table_foot(ui, &left, &format!("最多 {LOG_MAX} 条"));
         },
     );
     if clear {
         s.log.clear();
         s.selected = None;
+        s.frozen = None;
     }
     if pick.is_some() {
         s.selected = pick;
@@ -508,6 +619,20 @@ mod tests {
         }
         assert_eq!(s.log.len(), LOG_MAX);
         assert_eq!(s.shown().unwrap().id, (LOG_MAX + 4) as u64);
+    }
+
+    #[test]
+    fn loop_records_each_period() {
+        let mut s = Spi {
+            looping: true,
+            ..Spi::default()
+        };
+        assert!(s.tick(Duration::from_millis(250)));
+        // at 0, 100 and 200 ms
+        assert_eq!(s.log.len(), 3);
+        s.mosi = "zz".into();
+        assert!(!s.tick(Duration::from_millis(300)));
+        assert!(!s.looping && s.err.is_some());
     }
 
     #[test]
