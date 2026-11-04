@@ -14,6 +14,9 @@ use crate::local::{self, hex_upper, label, parse_hex, parse_num, Saved, Ticker, 
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
 
+#[cfg(test)]
+mod fd_tests;
+
 const CHANNELS: [(u8, &str); 2] = [(1, "CAN1"), (2, "CAN2")];
 const RATES: [(u32, &str); 4] = [
     (125, "125 kbit/s"),
@@ -21,7 +24,18 @@ const RATES: [(u32, &str); 4] = [
     (500, "500 kbit/s"),
     (1000, "1000 kbit/s"),
 ];
-const PROTOCOLS: [(u8, &str); 1] = [(0, "经典 CAN")];
+const DATA_RATES: [(u32, &str); 6] = [
+    (500, "500 kbit/s"),
+    (1000, "1 Mbit/s"),
+    (2000, "2 Mbit/s"),
+    (4000, "4 Mbit/s"),
+    (5000, "5 Mbit/s"),
+    (8000, "8 Mbit/s"),
+];
+const PROTOCOLS: [(Protocol, &str); 2] =
+    [(Protocol::Classic, "经典 CAN"), (Protocol::Fd, "CAN FD")];
+/// CAN FD wire lengths for DLC 9 through 15 (ISO CAN FD).
+const FD_LENGTHS: [usize; 7] = [12, 16, 20, 24, 32, 48, 64];
 /// Work mode: true is listen-only.
 const MODES: [(bool, &str); 2] = [(false, "正常模式"), (true, "只听模式")];
 /// Send format: true is extended.
@@ -34,11 +48,47 @@ const STD_MAX: u32 = 0x7ff;
 pub const WIDE: f32 = 1100.0;
 const EXT_MAX: u32 = 0x1fff_ffff;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Protocol {
+    Classic,
+    Fd,
+}
+
+impl Protocol {
+    fn max_len(self) -> usize {
+        match self {
+            Self::Classic => 8,
+            Self::Fd => 64,
+        }
+    }
+
+    fn dlc(self, len: usize) -> Result<u8, String> {
+        if len <= 8 {
+            return Ok(len as u8);
+        }
+        if self == Self::Classic {
+            return Err("经典 CAN 一帧最多 8 字节".into());
+        }
+        if len > 64 {
+            return Err("CAN FD 一帧最多 64 字节".into());
+        }
+        FD_LENGTHS
+            .iter()
+            .position(|&n| n == len)
+            .map(|i| i as u8 + 9)
+            .ok_or_else(|| {
+                "CAN FD 长度须为 0–8、12、16、20、24、32、48 或 64 字节，不自动补齐".into()
+            })
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 struct Config {
     channel: u8,
     rate: u32,
-    protocol: u8,
+    protocol: Protocol,
+    data_rate: u32,
+    brs: bool,
     listen_only: bool,
     ext: bool,
     filter_id: String,
@@ -52,7 +102,9 @@ impl Default for Config {
         Self {
             channel: 1,
             rate: 500,
-            protocol: 0,
+            protocol: Protocol::Classic,
+            data_rate: 2000,
+            brs: true,
             listen_only: false,
             ext: false,
             filter_id: "0x000".into(),
@@ -98,9 +150,23 @@ struct Frame {
     tx: bool,
     id: u32,
     ext: bool,
+    /// Snapshot of the frame format; later config changes do not relabel history.
+    protocol: Protocol,
+    brs: bool,
+    dlc: u8,
     data: Vec<u8>,
-    /// Since the last frame with the same ID.
+    /// Since the last frame with the same protocol, direction, ID and format.
     gap: Option<Duration>,
+}
+
+impl Frame {
+    fn protocol_label(&self) -> &'static str {
+        match (self.protocol, self.brs) {
+            (Protocol::Classic, _) => "CAN",
+            (Protocol::Fd, false) => "FD",
+            (Protocol::Fd, true) => "FD+BRS",
+        }
+    }
 }
 
 pub struct Can {
@@ -176,11 +242,17 @@ impl Can {
     }
 
     fn push(&mut self, at: Duration, tx: bool, id: u32, ext: bool, data: Vec<u8>) {
+        // User input is checked by editor_frame; seeds and generated frames
+        // use fixed, legal wire lengths.
+        let protocol = self.cfg.protocol;
+        let dlc = protocol
+            .dlc(data.len())
+            .expect("valid CAN demo frame length");
         let gap = self
             .log
             .iter()
             .rev()
-            .find(|f| f.id == id)
+            .find(|f| f.id == id && f.ext == ext && f.protocol == protocol && f.tx == tx)
             .map(|f| at.saturating_sub(f.at));
         if tx {
             self.tx += 1;
@@ -193,6 +265,9 @@ impl Can {
             tx,
             id,
             ext,
+            protocol,
+            brs: protocol == Protocol::Fd && self.cfg.brs,
+            dlc,
             data,
             gap,
         });
@@ -246,8 +321,16 @@ impl Can {
             ));
         }
         // IDs due on the same tick follow each other 2 ms apart
-        for (ms, id, ext, data) in due {
+        for (ms, id, ext, mut data) in due {
             if self.cfg.accepts(id) {
+                if self.cfg.protocol == Protocol::Fd {
+                    let len = match id {
+                        0x180 => 12,
+                        0x280 => 32,
+                        _ => 64,
+                    };
+                    data.extend((data.len()..len).map(|i| (k as u8).wrapping_add(i as u8)));
+                }
                 self.push(at + Duration::from_millis(ms), false, id, ext, data);
             }
         }
@@ -257,9 +340,7 @@ impl Can {
         let max = if self.cfg.ext { EXT_MAX } else { STD_MAX };
         let id = parse_hex(&self.send_id, max, "帧 ID ")?;
         let data = parse_bytes(&self.send_data)?;
-        if data.len() > 8 {
-            return Err("经典 CAN 一帧最多 8 字节".into());
-        }
+        self.cfg.protocol.dlc(data.len())?;
         Ok((id, data))
     }
 
@@ -280,6 +361,14 @@ impl Can {
         if self.receiving {
             for at in self.rx_ticker.take(now, TICK, 40) {
                 self.generate(at);
+            }
+        }
+        // A mode change can invalidate an existing payload before the next
+        // period is due. Stop without truncating or padding the editor data.
+        if self.looping {
+            if let Err(e) = self.editor_frame() {
+                self.send_err = Some(e);
+                self.looping = false;
             }
         }
         if self.looping {
@@ -355,6 +444,7 @@ pub fn page(ui: &mut egui::Ui, c: &mut Can, now: Duration) {
 
 fn config(ui: &mut egui::Ui, c: &mut Can) {
     let channel = label(&CHANNELS, c.cfg.channel);
+    let before = (c.cfg.protocol, c.cfg.ext, c.cfg.listen_only, c.cfg.brs);
     widgets::panel(
         ui,
         "接口配置",
@@ -367,11 +457,33 @@ fn config(ui: &mut egui::Ui, c: &mut Can) {
             widgets::field_row(ui, "硬件通道", false, |ui| {
                 widgets::pick(ui, &mut g.channel, &CHANNELS);
             });
-            widgets::field_row(ui, "总线速率", false, |ui| {
+            widgets::field_row(ui, "仲裁速率", false, |ui| {
                 widgets::pick(ui, &mut g.rate, &RATES);
             });
             widgets::field_row(ui, "协议模式", false, |ui| {
                 widgets::pick(ui, &mut g.protocol, &PROTOCOLS);
+            });
+            // Keep both rows in place when changing protocols or BRS.
+            widgets::field_row(ui, "数据速率", false, |ui| {
+                if g.protocol == Protocol::Fd && g.brs {
+                    widgets::pick(ui, &mut g.data_rate, &DATA_RATES);
+                } else {
+                    widgets::fixed_value(
+                        ui,
+                        label(&RATES, g.rate),
+                        "未启用 BRS，数据与仲裁使用同一速率",
+                    );
+                }
+            });
+            widgets::field_row(ui, "BRS", false, |ui| {
+                let mut enabled = g.protocol == Protocol::Fd && g.brs;
+                ui.add_enabled_ui(g.protocol == Protocol::Fd, |ui| {
+                    if widgets::check(ui, &mut enabled, "数据段变速").changed() {
+                        g.brs = enabled;
+                    }
+                })
+                .response
+                .on_disabled_hover_text("BRS 仅用于 CAN FD");
             });
             widgets::field_row(ui, "工作模式", false, |ui| {
                 widgets::pick(ui, &mut g.listen_only, &MODES);
@@ -401,8 +513,14 @@ fn config(ui: &mut egui::Ui, c: &mut Can) {
             c.saved.foot(ui, &mut c.cfg);
         },
     );
+    if before != (c.cfg.protocol, c.cfg.ext, c.cfg.listen_only, c.cfg.brs) {
+        c.send_err = None;
+    }
     ui.add_space(8.0);
-    widgets::note(ui, "CAN FD 为可选扩展，仅在硬件支持时开放。");
+    widgets::note(
+        ui,
+        "经典 CAN 最多 8 字节；CAN FD 最多 64 字节，BRS 控制数据段变速。",
+    );
     widgets::note(
         ui,
         "当前固件没有 CAN 命令：报文由本窗口生成，发送只记入本页。",
@@ -442,8 +560,9 @@ fn monitor(ui: &mut egui::Ui, c: &mut Can) {
                 widgets::muted(
                     ui,
                     &format!(
-                        "{} · HEX · {}",
+                        "{} · {} · {}",
                         label(&CHANNELS, c.cfg.channel),
+                        label(&PROTOCOLS, c.cfg.protocol),
                         label(&RATES, c.cfg.rate)
                     ),
                 );
@@ -468,7 +587,7 @@ fn monitor(ui: &mut egui::Ui, c: &mut Can) {
                 });
             });
             let table = Table {
-                widths: &[92.0, 40.0, 88.0, 40.0, 36.0, 0.0, 66.0],
+                widths: &[92.0, 40.0, 88.0, 62.0, 40.0, 36.0, 0.0, 66.0],
             };
             let time = if c.cfg.wall {
                 "时间 · UTC"
@@ -477,7 +596,16 @@ fn monitor(ui: &mut egui::Ui, c: &mut Can) {
             };
             table.header(
                 ui,
-                &[time, "方向", "ID", "类型", "长度", "数据 / HEX", "间隔"],
+                &[
+                    time,
+                    "方向",
+                    "ID",
+                    "协议",
+                    "类型",
+                    "长度",
+                    "数据 / HEX",
+                    "间隔",
+                ],
             );
             let shown: Vec<&Frame> = c
                 .log
@@ -508,12 +636,22 @@ fn monitor(ui: &mut egui::Ui, c: &mut Can) {
                                 true,
                             ),
                             (id, t.fg, true),
+                            (f.protocol_label().to_owned(), t.fg2, true),
                             ((if f.ext { "EXT" } else { "STD" }).to_owned(), t.fg2, true),
                             (f.data.len().to_string(), t.fg, true),
                             (hex_upper(&f.data), t.fg, true),
                             (gap_text(f.gap), t.muted, true),
                         ];
-                        if table.row(ui, &cells, c.selected == Some(f.n)).clicked() {
+                        if table
+                            .row(ui, &cells, c.selected == Some(f.n))
+                            .on_hover_text(format!(
+                                "{} · DLC {}\n{}",
+                                f.protocol_label(),
+                                f.dlc,
+                                hex_upper(&f.data)
+                            ))
+                            .clicked()
+                        {
                             pick = Some(f.n);
                         }
                     }
@@ -567,6 +705,9 @@ fn detail(ui: &mut egui::Ui, c: &mut Can) {
                 false,
             );
             widgets::kv(ui, "长度", &format!("{} B", f.data.len()), t.fg, false);
+            widgets::kv(ui, "协议", label(&PROTOCOLS, f.protocol), t.fg, false);
+            widgets::kv(ui, "DLC", &f.dlc.to_string(), t.fg, true);
+            widgets::kv(ui, "BRS", if f.brs { "开启" } else { "关闭" }, t.fg, false);
             widgets::kv(ui, "帧格式", if f.ext { "EXT" } else { "STD" }, t.fg, false);
             widgets::kv(ui, "间隔", &gap_text(f.gap), t.fg, true);
             ui.add_space(6.0);
@@ -578,11 +719,22 @@ fn detail(ui: &mut egui::Ui, c: &mut Can) {
 
 fn compose(ui: &mut egui::Ui, c: &mut Can, now: Duration) {
     let t = theme::of(ui);
+    let length = parse_bytes(&c.send_data)
+        .and_then(|data| {
+            c.cfg.protocol.dlc(data.len()).map(|dlc| {
+                format!(
+                    "{} / {} B · DLC {dlc}",
+                    data.len(),
+                    c.cfg.protocol.max_len()
+                )
+            })
+        })
+        .unwrap_or_else(|_| format!("HEX · 最多 {} B", c.cfg.protocol.max_len()));
     widgets::panel(
         ui,
         "发送编辑器",
         |ui| {
-            widgets::muted(ui, "HEX");
+            widgets::muted(ui, &length);
         },
         |ui| {
             ui.horizontal_top(|ui| {
@@ -606,6 +758,7 @@ fn compose(ui: &mut egui::Ui, c: &mut Can, now: Duration) {
                         "标准数据帧"
                     };
                     widgets::badge(ui, kind, Tone::Neutral);
+                    widgets::muted(ui, label(&PROTOCOLS, c.cfg.protocol));
                 });
                 let right_w = 150.0;
                 let mid = ui.available_width() - right_w - 8.0;
@@ -614,7 +767,7 @@ fn compose(ui: &mut egui::Ui, c: &mut Can, now: Duration) {
                         egui::TextEdit::multiline(&mut c.send_data)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(mid)
-                            .desired_rows(3),
+                            .desired_rows(if c.cfg.protocol == Protocol::Fd { 5 } else { 3 }),
                     )
                     .changed()
                 {
@@ -641,6 +794,9 @@ fn compose(ui: &mut egui::Ui, c: &mut Can, now: Duration) {
                     }
                 });
             });
+            if c.cfg.protocol == Protocol::Fd {
+                widgets::muted(ui, "长度：0–8、12、16、20、24、32、48、64 B；不自动补齐。");
+            }
             let problem = c.send_err.clone().or_else(|| c.editor_frame().err());
             match problem {
                 Some(e) => widgets::error(ui, &e),

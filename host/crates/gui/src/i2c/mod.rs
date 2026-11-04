@@ -68,10 +68,14 @@ pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Op> {
         Tab::Slave => "EEPROM 式寄存器表，256 字节、1 字节偏移，在本窗口编辑。",
     };
     widgets::page_head(ui, "I2C", Some(badge), subtitle, |ui| {
-        if st.tab == Tab::Master {
+        // Keep the action slot so switching tabs never moves the tab buttons.
+        ui.scope(|ui| {
+            if st.tab != Tab::Master {
+                ui.set_invisible();
+            }
             master::save_button(ui, &mut st.master, cx.now);
-            ui.add_space(6.0);
-        }
+        });
+        ui.add_space(6.0);
         widgets::seg(
             ui,
             &mut st.tab,
