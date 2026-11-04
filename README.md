@@ -14,7 +14,7 @@
 | 电脑端库与 CLI `usb-i2c` | 代码已有。会话失效与重连行为**待上板** | `list` / `ping` / `write` / `read` / `wr`。超时或损坏回复使会话失效，不自动重试 |
 | GUI `usb-i2c-gui` | 界面已合入（BusStudio 全模块页）。实机连接与 I2C **待上板** | 设备连接发 `CMD_PING`；I2C 主机的写入、读取、写后读（及同一笔循环）发 `CMD_I2C` |
 | I2C 扫描、总线恢复、从机寄存器表下发 | 本地演示 | 固件没有这些命令。扫描和总线恢复只往事务表插标「演示」的行；从机页在本窗口编辑 256 字节表 |
-| SPI、CAN、LIN、UART、PWM、GPIO、AD 记录、ADS1015、EEPROM、Flash、UDS | 本地演示 | 侧栏有页面，数据留在本次窗口，不发明 USB 命令，也不代表某块芯片或本设备的能力 |
+| SPI、CAN、LIN、UART、PWM / 频率捕获、GPIO、AD 记录、ADS1015、EEPROM、Flash、UDS | 本地演示 | 侧栏有页面，数据留在本次窗口，不发明 USB 命令，也不代表某块芯片或本设备的能力 |
 | 硬件 I2C 主机自测 `firmware/i2c_proto`（T1.8） | 已上板（无单独日志） | 独立固件，对端是 SDK 从机示例。通过读数写在 [AGENTS.md](AGENTS.md)：`c0ffee18`、写/读成功、0 处不一致、缺席地址为 `status_i2c_no_addr_hit`（2003） |
 | 从机寄存器表 `firmware/slave_proto`（T1.9） | 100 kHz 直连已上板；400 kHz **待上板** | 独立固件，不经 USB。记录见 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) |
 | USB 批量吞吐 `firmware/usb_speed` 与 `usb-speed` | 工具已有；本仓库无实测报告，**待上板** | 与 I2C 桥不同固件。两边都使用测试号 VID:PID `1209:0001`，产品字符串分别为 `usb_speed` 和 `usb_i2c` |
@@ -160,6 +160,7 @@ tools/flash.sh firmware/usb_i2c/build/output/demo.elf
 | [PRD.md](PRD.md) | 产品需求草案：目标、范围、尚未冻结的决定 |
 | [DEV_PLAN.md](DEV_PLAN.md) | 开发计划草案：阶段、目录规划、尚未落地的模块 |
 | [docs/host-reliability.md](docs/host-reliability.md) | 单桥恢复、不自动重试、EEPROM / AD 演示页、测试与待上板项 |
+| [docs/pwm-frequency-capture.md](docs/pwm-frequency-capture.md) | PWM / 频率捕获合页、本地演示交互、预览和硬件接入边界 |
 | [host/crates/gui/UI_MERGE_NOTES.md](host/crates/gui/UI_MERGE_NOTES.md) | 哪些控件发 USB，哪些只在本窗口；页面与代码结构 |
 | [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) | 从机寄存器表上板记录（100 kHz 通过，400 kHz 待重测） |
 | [AGENTS.md](AGENTS.md) | 工具链、各固件的构建与烧录、T1.8 通过读数 |

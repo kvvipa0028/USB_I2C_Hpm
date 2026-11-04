@@ -255,11 +255,15 @@ impl eframe::App for App {
         if self.spi.tick(now) {
             live.push(Page::Spi);
         }
+        let pwm_timed = self.pwm.tick(now);
+        if self.pwm.running() {
+            live.push(Page::Pwm);
+        }
         // EEPROM, Flash and UDS step on clicks; only timed demos need frames
         let timed = live
             .iter()
-            .any(|p| !matches!(p, Page::Eeprom | Page::Flash | Page::Uds));
-        if timed || self.i2c.master.looping() {
+            .any(|p| !matches!(p, Page::Eeprom | Page::Flash | Page::Uds | Page::Pwm));
+        if timed || pwm_timed || self.i2c.master.looping() {
             ui.ctx().request_repaint_after(local::TICK);
         }
 
@@ -417,7 +421,7 @@ fn footer_note(page: Page) -> &'static str {
     match page {
         Page::Device | Page::I2c => "I2C0 · 100 kHz（固件固定）",
         Page::Spi => "SPI · 本地会话",
-        Page::Pwm => "PWM · 配置预览",
+        Page::Pwm => "PWM / 捕获 · 本地演示，不发 USB",
         Page::Can => "CAN · 本地演示，未接线",
         Page::Lin => "LIN · 本地演示，未接线",
         Page::Uart => "UART · 本地回显，未接线",
