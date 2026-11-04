@@ -433,6 +433,11 @@ impl Run {
         self.step = i;
         self.since = at;
         self.parts = 0;
+        // Per-download scope: Bytes.total is image_bytes(), so confirmed must not
+        // accumulate across multiple download steps in one run.
+        if self.plan.steps[i].id == "download" {
+            self.confirmed = 0;
+        }
         let label = self.plan.steps[i].label.clone();
         self.emit(
             at,
@@ -976,5 +981,62 @@ mod tests {
             _ => None,
         });
         assert_eq!(last, Some((262_144, 262_144)));
+    }
+
+    #[test]
+    fn two_download_steps_keep_confirmed_within_each_step_total() {
+        // Reproduce the Codex finding: without a per-download reset, confirmed
+        // would climb past image_bytes() once a second download step finishes.
+        let text = "\
+format = uds-mock-fixture
+version = 1
+package = 双下载作用域
+files = app.bin
+[entry dual]
+title = 两个 download（模拟）
+ecu = DEMO
+image = app.bin | 0x10000 | 100
+step = erase | 擦除
+step = download | 第一段下载
+step = download | 第二段下载
+step = verify | 校验
+";
+        let mut b = MockBackend::default();
+        let a = asset(text);
+        let plan = b
+            .prepare(&PrepareRequest {
+                asset: &a,
+                entry: "dual",
+                params: &[],
+            })
+            .unwrap();
+        assert_eq!(plan.image_bytes(), 100);
+        assert_eq!(plan.steps.iter().filter(|s| s.id == "download").count(), 2);
+        let run = b.start(&plan, Duration::ZERO).unwrap();
+        let events = b.poll(run, STEP * 100);
+        let bytes: Vec<(u64, u64)> = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::Bytes { confirmed, total } => Some((confirmed, total)),
+                _ => None,
+            })
+            .collect();
+        assert!(!bytes.is_empty(), "expected Bytes events");
+        for &(confirmed, total) in &bytes {
+            assert_eq!(total, 100);
+            assert!(
+                confirmed <= total,
+                "confirmed {confirmed} > total {total} in {bytes:?}"
+            );
+        }
+        // Each download reports PARTS progress events ending at total.
+        let ends: Vec<_> = bytes.iter().copied().filter(|&(c, t)| c == t).collect();
+        assert_eq!(
+            ends.len(),
+            2,
+            "one end-of-step Bytes per download: {bytes:?}"
+        );
+        let r = b.result(run).unwrap();
+        assert_eq!(r.outcome, Outcome::Succeeded);
     }
 }
