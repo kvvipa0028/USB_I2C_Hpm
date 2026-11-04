@@ -48,7 +48,7 @@ impl Page {
             Page::Can => "CAN",
             Page::Lin => "LIN",
             Page::Uart => "UART",
-            Page::Pwm => "PWM",
+            Page::Pwm => "PWM / 频率捕获",
             Page::Gpio => "GPIO",
             Page::Adc => "AD 记录",
             Page::Ads1015 => "ADS1015",
