@@ -1,0 +1,58 @@
+{
+  "format": "uds-flow-manifest",
+  "version": 1,
+  "package": "演示包 · 多入口",
+  "notes": ["三个入口必须显选；cal=fail@verify；lost=lost@download"],
+  "files": [
+    { "path": "app.bin", "role": "image", "media": "bin" },
+    { "path": "cal.bin", "role": "image", "media": "bin" },
+    { "path": "flash_driver.bin", "role": "driver", "media": "bin" }
+  ],
+  "entries": [
+    {
+      "id": "app",
+      "title": "应用程序刷写（模拟）",
+      "ecu": "DEMO-ECU-A",
+      "images": [{ "file": "app.bin", "base": "0x00010000", "len": 262144 }],
+      "needs": ["flash_driver.bin"],
+      "params": [
+        { "id": "p2", "label": "响应超时 P2", "unit": "ms", "editable": true, "lo": 1, "hi": 5000, "default": 50 }
+      ],
+      "steps": [
+        { "kind": "session", "label": "进入编程会话" },
+        { "kind": "security", "label": "安全访问" },
+        { "kind": "erase", "label": "擦除下载区域" },
+        { "kind": "download", "label": "分块下载应用程序" },
+        { "kind": "verify", "label": "ECU 完整性校验" },
+        { "kind": "reset", "label": "复位" }
+      ]
+    },
+    {
+      "id": "cal",
+      "title": "标定数据刷写 · 校验失败演示（模拟）",
+      "ecu": "DEMO-ECU-A",
+      "images": [{ "file": "cal.bin", "base": "0x00080000", "len": 32768 }],
+      "steps": [
+        { "kind": "session", "label": "进入编程会话" },
+        { "kind": "security", "label": "安全访问" },
+        { "kind": "erase", "label": "擦除标定区" },
+        { "kind": "download", "label": "下载标定数据" },
+        { "kind": "verify", "label": "标定完整性校验" }
+      ],
+      "simulate": { "failAt": "verify" }
+    },
+    {
+      "id": "lost",
+      "title": "应用程序刷写 · 后端失联演示（模拟）",
+      "ecu": "DEMO-ECU-B",
+      "images": [{ "file": "app.bin", "base": "0x00010000", "len": 262144 }],
+      "steps": [
+        { "kind": "session", "label": "进入编程会话" },
+        { "kind": "erase", "label": "擦除下载区域" },
+        { "kind": "download", "label": "分块下载应用程序" },
+        { "kind": "verify", "label": "ECU 完整性校验" }
+      ],
+      "simulate": { "lostAt": "download" }
+    }
+  ]
+}
