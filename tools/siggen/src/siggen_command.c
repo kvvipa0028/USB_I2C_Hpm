@@ -133,6 +133,11 @@ bool siggen_command_parse(const char *line, siggen_command_t *out)
         if ((result.kind == SIG_CMD_NACK_ADDRESS && v > 1U) ||
             (result.kind == SIG_CMD_NACK_DATA && v > 256U)) return false;
         result.value[0] = v;
+    } else if (!text_compare(t0, "hold_sda_clocks")) {
+        if (!next_token(&p, t1, sizeof(t1)) || !next_token(&p, t2, sizeof(t2)) ||
+            !parse_u32(t1, &result.value[0]) || result.value[0] != 9U ||
+            !parse_u32(t2, &result.value[1]) || result.value[1] < 1U || result.value[1] > 5000000U) return false;
+        result.kind = SIG_CMD_HOLD_SDA_CLOCKS;
     } else if (!text_compare(t0, "hold")) {
         if (!next_token(&p, t1, sizeof(t1)) || !next_token(&p, t2, sizeof(t2)) || !parse_u32(t2, &v) || v < 1U || v > 5000U) return false;
         if (!text_compare(t1, "scl")) result.value[0] = 1U;

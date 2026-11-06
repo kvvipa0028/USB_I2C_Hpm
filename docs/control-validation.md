@@ -55,7 +55,7 @@ Windows `cargo check --target x86_64-pc-windows-msvc` 只证明编译；在 ARM6
 
 ## S4 可控测试对端
 
-`tools/siggen` 提供 EVKMini 上的 CDC 参考从机、可编程表、NACK、ACK 延迟和开漏卡线注入，用于给下面的 S3/S4 验收提供可控对端。命令、边界和操作顺序见 [siggen-control-peer.md](siggen-control-peer.md)。对端状态/计数是辅助证据，实际拉伸时长、ACK/NACK 和恢复脉冲仍以逻辑分析仪为准。
+`tools/siggen` 提供 EVKMini 上的 CDC 参考从机、可编程表、NACK、ACK 延迟和开漏卡线注入，用于给下面的 S3/S4 验收提供可控对端。`hold_sda_clocks 9 <timeout_us>` 在第 9 个 SCL 上升沿释放 SDA，并提供超时与取消保护，用于准备 S4-RECOVERY 的受控释放场景。命令、边界和操作顺序见 [siggen-control-peer.md](siggen-control-peer.md)。对端状态/计数是辅助证据，实际拉伸时长、ACK/NACK、释放延迟和恢复脉冲仍以逻辑分析仪为准。
 
 ```sh
 cmake -S tools/siggen/tests -B /tmp/siggen-native -G Ninja

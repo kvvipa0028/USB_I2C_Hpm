@@ -4,9 +4,9 @@
 #include <string.h>
 
 typedef struct {
-    bool configured, config_ok, busy, ack_valid, complete, configured_slave, address_nack;
+    bool configured, config_ok, busy, ack_valid, complete, configured_slave, address_nack, clock_arm_ok;
     uint8_t low_mask, lines, configured_address;
-    uint32_t config_count, disables, unholds, holds, acks, nacks, starts, configured_hz, line_calls;
+    uint32_t config_count, disables, unholds, holds, acks, nacks, starts, configured_hz, line_calls, clock_generation;
     siggen_result_t result;
 } fake_t;
 static siggen_peer_t p;
@@ -37,11 +37,16 @@ static bool poll(void *ctx, bool read, siggen_result_t *r, uint8_t data[2])
     fake_t *h = ctx; (void)read; if (!h->complete) return false;
     *r = h->result; data[0] = 0x11; data[1] = 0x22; return true;
 }
+static bool hold_clocks(void *ctx, uint32_t generation)
+{
+    fake_t *h = ctx; h->low_mask = 2; h->clock_generation = generation;
+    return h->clock_arm_ok;
+}
 static void setup(void)
 {
-    memset(&f, 0, sizeof(f)); f.config_ok = true; f.ack_valid = true; f.lines = 3;
+    memset(&f, 0, sizeof(f)); f.config_ok = true; f.ack_valid = true; f.clock_arm_ok = true; f.lines = 3;
     siggen_hal_t hal = { &f, config, disable, busy, hold, unhold, lines, ack,
-        ack_valid, begin, poll };
+        ack_valid, begin, poll, hold_clocks };
     siggen_peer_init(&p, &hal);
     assert(p.mode == SIG_MODE_IDLE && !p.running && f.low_mask == 0);
 }
@@ -135,6 +140,77 @@ static void hold_tests(void)
     assert(f.low_mask == 0 && p.mode == SIG_MODE_SLAVE && !p.running);
     cmd("hold both 5000", 0, "OK"); siggen_peer_stop(&p); assert(f.low_mask == 0 && p.mode == SIG_MODE_IDLE);
 }
+static uint32_t arm_clocks(uint64_t now)
+{
+    setup(); cmd("slave 0x50 100000", now, "OK");
+    cmd("hold_sda_clocks 9 1000", now, "OK");
+    assert(p.clock_armed && p.clock_requested == 9 && p.clock_observed == 0 && f.low_mask == 2);
+    return f.clock_generation;
+}
+static bool rising(uint32_t generation, uint64_t now)
+{
+    bool release = siggen_peer_scl_rising(&p, generation, now);
+    if (release) f.low_mask = 0; /* Same immediate action as the GPIO ISR. */
+    return release;
+}
+static void clock_tests(void)
+{
+    uint32_t generation = arm_clocks(100);
+    uint32_t configs = f.config_count;
+    siggen_peer_poll(&p, 101); /* Initial high input alone is not an event. */
+    assert(p.clock_observed == 0 && f.low_mask == 2);
+    for (unsigned i = 0; i < 8; ++i) assert(!rising(generation, 110U + i));
+    assert(p.clock_observed == 8 && f.low_mask == 2);
+    assert(rising(generation, 119) && p.clock_observed == 9 && f.low_mask == 0);
+    assert(p.clock_result == SIG_CLOCK_COMPLETED && p.clock_restore_pending);
+    assert(f.config_count == configs); /* ISR completion never restores I2C. */
+    assert(!rising(generation, 120));
+    cmd("hold both 1", 121, "ERR busy");
+    siggen_peer_poll(&p, 122);
+    assert(f.config_count == configs + 1U && !p.clock_restore_pending && !p.running);
+    siggen_peer_poll(&p, 123); assert(f.config_count == configs + 1U);
+    siggen_peer_stop(&p); assert(p.clock_result == SIG_CLOCK_COMPLETED);
+
+    const char *cancel_commands[] = { "stop", "release", "master 0x51 400000", "slave 0x51 400000", "start" };
+    for (size_t c = 0; c < sizeof(cancel_commands) / sizeof(cancel_commands[0]); ++c) {
+        generation = arm_clocks(0);
+        for (unsigned i = 0; i < 8; ++i) assert(!rising(generation, i + 1U));
+        cmd(cancel_commands[c], 10, "OK");
+        assert(!p.clock_armed && f.low_mask == 0 && p.clock_result == SIG_CLOCK_CANCELLED);
+        assert(!rising(generation, 11));
+    }
+    generation = arm_clocks(0);
+    siggen_peer_stop(&p);
+    cmd("hold_sda_clocks 9 1000", 10, "OK");
+    assert(!rising(generation, 11) && p.clock_observed == 0 && f.low_mask == 2);
+
+    generation = arm_clocks(UINT64_MAX - 499U);
+    siggen_peer_poll(&p, 499); assert(f.low_mask == 2 && p.clock_armed);
+    configs = f.config_count;
+    siggen_peer_poll(&p, 500);
+    assert(f.low_mask == 0 && !p.clock_armed && p.clock_result == SIG_CLOCK_TIMEOUT);
+    assert(f.config_count == configs + 1U && !rising(generation, 501));
+    generation = arm_clocks(0);
+    for (unsigned i = 0; i < 8; ++i) assert(!rising(generation, i + 1U));
+    assert(rising(generation, 1000));
+    assert(p.clock_result == SIG_CLOCK_TIMEOUT && p.clock_observed == 8);
+    siggen_peer_poll(&p, 1001); assert(!p.clock_restore_pending && f.low_mask == 0);
+    setup(); cmd("hold_sda_clocks 9 1", 100, "OK");
+    assert(rising(f.clock_generation, 101) && p.clock_observed == 0 && p.clock_result == SIG_CLOCK_TIMEOUT);
+
+    generation = arm_clocks(0); f.config_ok = false;
+    for (unsigned i = 0; i < 9; ++i) (void)rising(generation, i + 1U);
+    siggen_peer_poll(&p, 10);
+    assert(p.clock_restore_error && p.clock_result == SIG_CLOCK_COMPLETED && p.mode == SIG_MODE_IDLE && f.low_mask == 0);
+    generation = arm_clocks(0); f.config_ok = false; siggen_peer_poll(&p, 1000);
+    assert(p.clock_restore_error && p.clock_result == SIG_CLOCK_TIMEOUT && f.low_mask == 0 && !rising(generation, 1001));
+    setup(); f.clock_arm_ok = false; cmd("hold_sda_clocks 9 1000", 0, "ERR clock arm; released\n");
+    assert(!p.clock_armed && f.low_mask == 0 && p.mode == SIG_MODE_IDLE && p.clock_result == SIG_CLOCK_ERROR);
+    generation = arm_clocks(0);
+    siggen_line_assembler_t line; siggen_line_assembler_init(&line);
+    assert(siggen_session_feed(&p, &line, -2, 1, response));
+    assert(f.low_mask == 0 && !p.clock_armed && !rising(generation, 2));
+}
 static void master_tests(void)
 {
     setup(); cmd("start", 0, "OK start\n"); siggen_peer_poll(&p, 99999); assert(f.starts == 0);
@@ -178,9 +254,18 @@ static void session_tests(void)
     p.rx_bytes = p.tx_bytes = p.ack_count = p.nack_count = UINT32_MAX;
     p.stretch_count = p.hold_count = p.cancelled_acks = UINT32_MAX;
     p.ack_deadline = p.last_stretch_us = p.max_stretch_us = p.max_poll_gap_us = UINT64_MAX;
+    p.speed_hz = p.stretch_us = p.nack_data = UINT32_MAX;
+    p.write_result = (siggen_result_t){ SIG_RESULT_ADDRESS_NACK, UINT32_MAX };
+    p.read_result = p.write_result;
+    p.clock_requested = p.clock_observed = 9;
+    p.clock_result = SIG_CLOCK_COMPLETED; p.clock_restore_error = true;
     cmd("status", 0, "OK running="); assert(strstr(response, "read_hex=") != NULL);
     assert(strstr(response, "tx_datacnt_mod256_sum=4294967295 tx_count_bits=8") != NULL);
     assert(strstr(response, " tx_bytes=") == NULL);
+    assert(strstr(response, "clock_requested=9 clock_observed=9 clock_result=completed clock_restore_error=1\n") != NULL);
+    /* Reserve the exact maximum-width CDC suffix appended by target main. */
+    const char suffix[] = " usb_rx_overflows=4294967295 usb_tx_rejected=4294967295\n";
+    assert(strlen(response) - 1U + sizeof(suffix) <= SIGGEN_RESPONSE_CAP);
 }
 static void reply_snapshot_tests(void)
 {
@@ -218,7 +303,7 @@ static void reply_snapshot_tests(void)
 }
 int main(void)
 {
-    table_tests(); nack_tests(); stretch_tests(); hold_tests(); master_tests(); session_tests(); reply_snapshot_tests();
+    table_tests(); nack_tests(); stretch_tests(); hold_tests(); clock_tests(); master_tests(); session_tests(); reply_snapshot_tests();
     puts("siggen peer/session tests passed");
     return 0;
 }

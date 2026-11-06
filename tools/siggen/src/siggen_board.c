@@ -1,4 +1,5 @@
 #include "siggen_board.h"
+#include "siggen_recovery_gpio.h"
 #include "board.h"
 #include "hpm_i2c_drv.h"
 #include "hpm_gpio_drv.h"
@@ -42,6 +43,7 @@ static void drive(uint8_t mask)
 static void disable(void *context)
 {
     (void)context;
+    siggen_recovery_gpio_disarm();
     intc_m_disable_irq(PEER_IRQ);
     PEER_I2C->INTEN = 0;
     i2c_reset(PEER_I2C);
@@ -49,6 +51,7 @@ static void disable(void *context)
 static void unhold(void *context)
 {
     (void)context;
+    siggen_recovery_gpio_disarm();
     drive(0);
     init_i2c_pins(PEER_I2C);
 }
@@ -61,6 +64,11 @@ static void hold(void *context, uint8_t mask)
     HPM_IOC->PAD[IOC_PAD_PB11].FUNC_CTL = IOC_PB11_FUNC_CTL_GPIO_B_11;
     HPM_IOC->PAD[IOC_PAD_PB10].FUNC_CTL = IOC_PB10_FUNC_CTL_GPIO_B_10;
     drive(mask);
+}
+static bool hold_sda_clocks(void *context, uint32_t generation)
+{
+    hold(context, 2);
+    return siggen_recovery_gpio_arm(peer, generation);
 }
 static bool configure(void *context, bool slave, uint8_t address, uint32_t hz, bool address_nack)
 {
@@ -146,7 +154,8 @@ static bool master_poll(void *context, bool read, siggen_result_t *result, uint8
 }
 static const siggen_hal_t hal = { .context = NULL, .configure = configure, .disable = disable,
     .busy = busy, .hold = hold, .unhold = unhold, .lines = lines, .ack = ack,
-    .ack_valid = ack_valid, .master_begin = master_begin, .master_poll = master_poll };
+    .ack_valid = ack_valid, .master_begin = master_begin, .master_poll = master_poll,
+    .hold_sda_clocks = hold_sda_clocks };
 const siggen_hal_t *siggen_board_hal(void) { return &hal; }
 void siggen_board_init(siggen_peer_t *p)
 {

@@ -10,6 +10,8 @@ enum siggen_result { SIG_RESULT_PENDING, SIG_RESULT_OK, SIG_RESULT_ADDRESS_NACK,
     SIG_RESULT_DATA_NACK, SIG_RESULT_TIMEOUT, SIG_RESULT_ERROR, SIG_RESULT_CANCELLED,
     SIG_RESULT_NOT_RUN };
 enum siggen_ack { SIG_ACK_NOW, SIG_NACK_NOW, SIG_ACK_DEFER };
+enum siggen_clock_result { SIG_CLOCK_NONE, SIG_CLOCK_ARMED, SIG_CLOCK_COMPLETED,
+    SIG_CLOCK_TIMEOUT, SIG_CLOCK_CANCELLED, SIG_CLOCK_ERROR };
 typedef struct { enum siggen_result result; uint32_t raw; } siggen_result_t;
 typedef struct {
     void *context;
@@ -23,6 +25,7 @@ typedef struct {
     bool (*ack_valid)(void *);
     bool (*master_begin)(void *, bool read, uint8_t address);
     bool (*master_poll)(void *, bool read, siggen_result_t *result, uint8_t data[2]);
+    bool (*hold_sda_clocks)(void *, uint32_t generation);
 } siggen_hal_t;
 
 typedef struct {
@@ -38,6 +41,10 @@ typedef struct {
     uint32_t ack_count, nack_count, stretch_count, hold_count, cancelled_acks;
     uint64_t last_stretch_us, max_stretch_us, max_poll_gap_us;
     siggen_result_t write_result, read_result;
+    uint32_t clock_generation;
+    uint8_t clock_requested, clock_observed;
+    bool clock_armed, clock_restore_pending, clock_restore_error;
+    enum siggen_clock_result clock_result;
     uint8_t table[256];
 } siggen_peer_t;
 
@@ -56,6 +63,9 @@ void siggen_peer_init(siggen_peer_t *p, const siggen_hal_t *hal);
 /* Caller serializes with the I2C ISR; no function waits for hardware. */
 void siggen_peer_poll(siggen_peer_t *p, uint64_t now);
 void siggen_peer_stop(siggen_peer_t *p);
+/* GPIO rising-edge ISR only. True requests immediate SDA input release; mux
+ * and role restoration are deferred to poll. A stale generation is ignored. */
+bool siggen_peer_scl_rising(siggen_peer_t *p, uint32_t generation, uint64_t now);
 /* Prepare mutates/copies under the peer lock; format uses only that snapshot
  * and must run after unlock, with no HAL calls or live peer reads. */
 void siggen_peer_prepare(siggen_peer_t *p, const siggen_command_t *cmd,

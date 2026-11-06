@@ -1,6 +1,6 @@
 # S4 CDC 参考从机与故障注入对端
 
-`tools/siggen` 用于 HPM6750EVKMini 的 I2C0 对端验证，保留旧 `start/stop/status/help` 命令，并增加可编程从机、NACK、写数据阶段 clock stretch 和有期限的卡线。它不是产品固件，也不替代仪器波形证据。本轮未烧录、未连接对端。
+`tools/siggen` 用于 HPM6750EVKMini 的 I2C0 对端验证，保留旧 `start/stop/status/help` 命令，并增加可编程从机、NACK、写数据阶段 clock stretch、定时卡线及第9个SCL升沿释放SDA的恢复治具模式。它不是产品固件，也不替代仪器波形证据。本轮未烧录、未连接对端。
 
 ## 板级边界与构建
 
@@ -33,6 +33,7 @@ ctest --test-dir /tmp/siggen-native --output-on-failure
 | `nack address <0或1>` | Slave模式；1禁用控制器的地址应答，形成地址缺席，0恢复；不是任意ADDRHIT ACK时序控制 |
 | `nack data <index>` | Slave模式；每笔写的1-based字节编号，偏移字节为1，首表数据为2；0关闭，范围0..256。指定字节及之后内容不入表 |
 | `hold <scl或sda或both> <ms>` | 仅空闲时进入GPIO故障，拉低指定线1..5000ms，到期释放并恢复已配置角色；旧master轮询不恢复 |
+| `hold_sda_clocks 9 <timeout_us>` | 仅空闲且SCL实读为高时启动；只拉低SDA，PB11 GPIO上升沿IRQ计数，第9沿释放SDA；超时1..5000000us也释放，仅支持9沿 |
 | `release` | 可在故障/忙态显式取消；释放线、清除stretch/NACK设置，恢复当前已配置角色，master轮询保持关闭；可重复执行 |
 | `table fill <byte>` | 空闲时填充256B表，byte为0..255 |
 | `table write <offset> <HEX>` | 空闲时写1..32B连续偶数字符HEX，不含空格，offset为0..255，片段不回绕 |
@@ -41,7 +42,9 @@ ctest --test-dir /tmp/siggen-native --output-on-failure
 
 地址限制为 `0x08..0x77`；标准速率仅100000、400000、1000000Hz。`hz`是请求配置，不能代替实测。默认地址0x50、100000Hz，启动后Idle，不自动发事务。
 
-角色、配置、表访问和新注入在外设忙/当前操作活动时返回 `ERR busy`；`stop/release`不受此状态限制，但仍遵守 CDC 请求/回复流控。若 host 停止读取 IN，应先读走回复，或关闭 DTR 触发独立的 stop 路径；不能把尚未解析的排队命令当作已执行取消。表为 EEPROM 语义：首写字节设偏移，后续写表并在0xFF回绕；读FIFO预取不计作已发送字节，实际偏移由完成时硬件DATACNT计算。HPM6700的DATACNT为8bit，status显式返回 `tx_count_bits=8` 和 `tx_datacnt_mod256_sum`：后者累加每笔读事务的DATACNT余数。单笔读达到256B后计数回绕，表偏移的模256语义仍成立，但该余数之和不能用于核算长事务的完整字节总数。table命令保留表内容，角色切换不擦表。两块对端之间的表独立；一个此固件仅提供一路物理I2C，不能冒充双路并发治具。
+新 `hold_sda_clocks` 模式允许 `master/slave/start` 先取消、释放再重配；旧定时hold仍维持busy拒绝合同。未知命令或非法参数按原合同拒绝，不改变当前有期限注入。
+
+除上述clock-hold重配例外外，角色、配置、表访问和新注入在外设忙/当前操作活动时返回 `ERR busy`；`stop/release`不受此状态限制，但仍遵守 CDC 请求/回复流控。若 host 停止读取 IN，应先读走回复，或关闭 DTR 触发独立的 stop 路径；不能把尚未解析的排队命令当作已执行取消。表为 EEPROM 语义：首写字节设偏移，后续写表并在0xFF回绕；读FIFO预取不计作已发送字节，实际偏移由完成时硬件DATACNT计算。HPM6700的DATACNT为8bit，status显式返回 `tx_count_bits=8` 和 `tx_datacnt_mod256_sum`：后者累加每笔读事务的DATACNT余数。单笔读达到256B后计数回绕，表偏移的模256语义仍成立，但该余数之和不能用于核算长事务的完整字节总数。table命令保留表内容，角色切换不擦表。两块对端之间的表独立；一个此固件仅提供一路物理I2C，不能冒充双路并发治具。
 
 ## 注入及取消语义
 
@@ -49,7 +52,13 @@ SDK HPM6700 `INTEN.BYTERECV` 明确关闭硬件auto-ACK。ISR先处理ADDRHIT、
 
 拉伸仅覆盖每笔write的首数据字节，不覆盖地址ACK或纯read。要验证正常10ms拉伸，先 `slave 0x50 100000`、`stretch 10000`，再由DUT发offset+data写事务；超过DUT预算可用 `stretch 80000`。若同一首字节被设置NACK，NACK优先，不再延迟ACK。收到CMPL、下一ADDRHIT、取消或硬件状态不再支持pending ACK时，旧ACK被作废；native覆盖的是状态机无late ACK，不证明在物理SCL被拉低时一定能形成STOP/reSTART。
 
-GPIO故障先停I2C外设，再切PB11/PB10为GPIO open-drain。输出锁存器始终写0，拉低用output，释放用input，从不推高。到期或release先释放，再恢复I2C mux/配置；不自动发任何恢复脉冲。`hold sda 1000`可用于卡SDA、`hold scl 1000`用于卡SCL；主机应在自己的预算内失败。当前工具不按SCL边沿计数自动释放SDA，不能宣称“第9个脉冲释放” oracle 已具备；要验证9 clocks+STOP，需要逻辑分析仪及受控释放治具/人工时序。
+GPIO故障先停I2C外设，再切PB11/PB10为GPIO open-drain。输出锁存器始终写0，拉低用output，释放用input，从不推高。到期或release先释放，再恢复I2C mux/配置；不自动发任何恢复脉冲。`hold sda 1000`可用于卡SDA、`hold scl 1000`用于卡SCL；主机应在自己的预算内失败。
+
+恢复治具可先发送 `hold_sda_clocks 9 100000`，收到OK后由DUT发恢复脉冲。SCL保持input，SDA拉低；GPIO0_B只配置PB11的上升沿IRQ，按configure→clear旧IF→enable顺序启用，初始高状态不计脉冲，其他pin的IF既不计数也不清除。第1..8沿保持SDA低，第9沿ISR仅切PB10为input释放、关闭PB11 IRQ并标记完成；主循环随后恢复I2C mux/原角色，旧master循环不恢复。没有主循环轮询数边沿，也没有ISR内等待、格式化或I2C重初始化。
+
+`clock_requested`、`clock_observed`、`clock_result=none/armed/completed/timeout/cancelled/error` 和 `clock_restore_error` 显示软件观察。每个IRQ事件和主循环都检查同一有界deadline，等于deadline的第9沿按timeout处理。stop、release、USB会话丢失、RX overflow、重配和arm/restore错误均使旧generation无效并停PB11 IRQ、释放线；旧generation不能释放新请求。已完成/超时结果不会被后续stop覆盖；恢复配置失败另置 `clock_restore_error=1` 并转Idle，线保持释放。SCL实读低或arm失败返回 `ERR clock arm; released`，不保留半启动注入。
+
+该模式面向产品恢复序列（每个low/high至少5us）。`completed`只证明软件在deadline内接收了9次PB11上升沿事件并执行释放代码；GPIO中断是否漏边沿、第9沿到SDA实际上升的延迟、是否在第9个高相位内释放、最终STOP和总线空闲仍需原始波形。ISR读时钟包含64位换算，完整IRQ WCET未测，不能宣称1MHz无漏计或物理9 clocks+STOP已经通过。
 
 主机旧周期路径已替换为非阻塞状态机，每轮总期限500ms，状态区分pending/ok/address_nack/data_nack/timeout/error/cancelled/not_run。成功write与read独立记录；write NACK后仍按旧序列读，仲裁错误/超时不重放已执行写入。失败重置仅本对端I2C，不证明外部卡线已恢复。
 
@@ -59,6 +68,6 @@ USB reset/disconnect、DTR关闭及RX overflow都会通知主循环stop，清除
 
 ## 验证与未验证
 
-native四组测试直接编译生产parser、peer/session、CDC buffer及`cdc_acm.c`（USB API替身）：覆盖范围/超长拒绝、32B片段、offset回绕、NACK字节不提交、10000us阈值及uint64时间回绕、busy拒绝、hold/release、取消后无late ACK、重配置失败释放、host不读IN、FS/HS ZLP、DTR/reset清理、连续RX overflow与CR/CRLF边界尾串不执行，以及状态/表在prepare后发生变化时回复快照仍一致。使用严格告警、ASan和UBSan；另执行RISC-V GCC严格语法检查和HPM6750EVKMini release编译链接。
+native五组测试直接编译生产parser、peer/session、CDC buffer、`cdc_acm.c`（USB API替身）及 `siggen_recovery_gpio.c`（GPIO/IRQ API替身）：覆盖范围/超长拒绝、32B片段、offset回绕、NACK字节不提交、10000us阈值及uint64时间回绕、busy拒绝、hold/release、取消后无late ACK、重配置失败释放、host不读IN、FS/HS ZLP、DTR/reset清理、连续RX overflow与CR/CRLF边界尾串不执行，以及状态/表在prepare后发生变化时回复快照仍一致。恢复治具另覆盖初始high/共享IF不计数、arm清旧IF、1..8保持/第9仅一次释放、ISR不恢复角色、旧generation无效、1us/5s参数边界、deadline回绕、取消/重配/timeout/错误释放，以及最长status保留完整CDC统计尾部和换行。使用严格告警、ASan和UBSan；另执行RISC-V GCC严格语法检查和HPM6750EVKMini release编译链接。
 
 未验证：物理FIFO/DATACNT、NACK/ACK、10ms低段及超时边界、1MHz连续通信、USB拔插、SDA/SCL实际开漏释放、波形边沿和板级复用。保存仪器原始波形、host/对端ELF SHA-256、板号、上拉、电平与接线后，才能据此验收S4；这些测试不关闭S5或S6真实设备验收。

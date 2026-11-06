@@ -17,7 +17,12 @@ const char *siggen_result_name(enum siggen_result r)
 static bool active(const siggen_peer_t *p)
 {
     return p->master_phase != MASTER_NONE || p->slave_state != SLAVE_IDLE ||
-        p->pending_ack || p->held_mask != 0 || p->hal.busy(p->hal.context);
+        p->pending_ack || p->held_mask != 0 || p->clock_restore_pending || p->hal.busy(p->hal.context);
+}
+static void next_clock_generation(siggen_peer_t *p)
+{
+    ++p->clock_generation;
+    if (p->clock_generation == 0) ++p->clock_generation;
 }
 static bool configure(siggen_peer_t *p)
 {
@@ -27,6 +32,10 @@ static bool configure(siggen_peer_t *p)
 }
 static void cancel(siggen_peer_t *p)
 {
+    if (p->clock_armed) p->clock_result = SIG_CLOCK_CANCELLED;
+    p->clock_armed = false;
+    p->clock_restore_pending = false;
+    next_clock_generation(p);
     if (p->pending_ack) ++p->cancelled_acks;
     p->pending_ack = false;
     p->hal.disable(p->hal.context);
@@ -71,16 +80,51 @@ static void round_done(siggen_peer_t *p, uint64_t now)
         p->hal.disable(p->hal.context);
     }
 }
+bool siggen_peer_scl_rising(siggen_peer_t *p, uint32_t generation, uint64_t now)
+{
+    if (!p->clock_armed || generation != p->clock_generation) return false;
+    if (now - p->hold_started >= p->hold_duration_us) {
+        p->clock_result = SIG_CLOCK_TIMEOUT;
+    } else {
+        ++p->clock_observed;
+        if (p->clock_observed < p->clock_requested) return false;
+        p->clock_result = SIG_CLOCK_COMPLETED;
+    }
+    p->clock_armed = false;
+    p->clock_restore_pending = true;
+    p->held_mask = 0;
+    next_clock_generation(p);
+    return true;
+}
 void siggen_peer_poll(siggen_peer_t *p, uint64_t now)
 {
     if (p->last_poll != 0 && now - p->last_poll > p->max_poll_gap_us)
         p->max_poll_gap_us = now - p->last_poll;
     p->last_poll = now;
+    if (p->clock_restore_pending) {
+        p->clock_restore_pending = false;
+        p->hal.unhold(p->hal.context);
+        if (!configure(p)) {
+            p->clock_restore_error = true;
+            p->mode = SIG_MODE_IDLE;
+            p->hal.disable(p->hal.context);
+        }
+        return;
+    }
     if (p->held_mask != 0) {
         if (now - p->hold_started >= p->hold_duration_us) {
+            bool clock_timeout = p->clock_armed;
+            if (clock_timeout) {
+                p->clock_armed = false;
+                p->clock_result = SIG_CLOCK_TIMEOUT;
+                next_clock_generation(p);
+            }
             p->hal.unhold(p->hal.context);
             p->held_mask = 0;
-            if (!configure(p)) { p->mode = SIG_MODE_IDLE; p->hal.disable(p->hal.context); }
+            if (!configure(p)) {
+                if (clock_timeout) p->clock_restore_error = true;
+                p->mode = SIG_MODE_IDLE; p->hal.disable(p->hal.context);
+            }
         }
         return;
     }
@@ -191,6 +235,9 @@ static void format_status(const siggen_reply_t *reply, char *out, size_t cap)
 {
     const siggen_peer_t *p = &reply->snapshot;
     const char *mode = p->mode == SIG_MODE_MASTER ? "master" : p->mode == SIG_MODE_SLAVE ? "slave" : "idle";
+    static const char *const clock_names[] = { "none", "armed", "completed", "timeout", "cancelled", "error" };
+    const char *clock_result = (unsigned)p->clock_result < sizeof(clock_names) / sizeof(clock_names[0]) ?
+        clock_names[p->clock_result] : "invalid";
     (void)snprintf(out, cap,
         "OK running=%u rounds=%" PRIu32 " mode=%s addr=0x%02x hz=%" PRIu32
         " busy=%u lines=%u hold=%u ack_pending=%u stretch_us=%" PRIu32
@@ -200,7 +247,7 @@ static void format_status(const siggen_reply_t *reply, char *out, size_t cap)
         " rx_bytes=%" PRIu32 " tx_datacnt_mod256_sum=%" PRIu32 " tx_count_bits=8 ack=%" PRIu32 " nack=%" PRIu32
         " stretch_count=%" PRIu32 " hold_count=%" PRIu32 " cancelled_ack=%" PRIu32
         " write_status=%s write_raw=%" PRIu32 " read_status=%s read_raw=%" PRIu32
-        " read_hex=%02x%02x\n",
+        " read_hex=%02x%02x clock_requested=%u clock_observed=%u clock_result=%s clock_restore_error=%u\n",
         p->running ? 1U : 0U, p->rounds, mode, (unsigned)p->address, p->speed_hz,
         reply->busy ? 1U : 0U, (unsigned)reply->lines, (unsigned)p->held_mask,
         p->pending_ack ? 1U : 0U, p->stretch_us, p->ack_deadline, p->last_stretch_us,
@@ -209,7 +256,8 @@ static void format_status(const siggen_reply_t *reply, char *out, size_t cap)
         p->ack_count, p->nack_count, p->stretch_count, p->hold_count, p->cancelled_acks,
         siggen_result_name(p->write_result.result), p->write_result.raw,
         siggen_result_name(p->read_result.result), p->read_result.raw,
-        (unsigned)p->last_read[0], (unsigned)p->last_read[1]);
+        (unsigned)p->last_read[0], (unsigned)p->last_read[1], (unsigned)p->clock_requested,
+        (unsigned)p->clock_observed, clock_result, p->clock_restore_error ? 1U : 0U);
 }
 void siggen_peer_prepare(siggen_peer_t *p, const siggen_command_t *c, uint64_t now,
                          siggen_reply_t *reply)
@@ -227,7 +275,7 @@ void siggen_peer_prepare(siggen_peer_t *p, const siggen_command_t *c, uint64_t n
     }
     if (c->kind == SIG_CMD_HELP) {
         reply->kind = SIG_REPLY_TEXT;
-        reply->text = "OK start | stop | status | master/slave addr hz | stretch us (first write byte only) | nack address 0/1 | nack data index | hold scl/sda/both ms | release | table read off len<=32 | table fill byte | table write off hex<=32B\n";
+        reply->text = "OK start | stop | status | master/slave addr hz | stretch us (first write byte only) | nack address 0/1 | nack data index | hold scl/sda/both ms | hold_sda_clocks 9 timeout_us | release | table read off len<=32 | table fill byte | table write off hex<=32B\n";
         return;
     }
     if (c->kind == SIG_CMD_STOP) { siggen_peer_stop(p); reply->kind = SIG_REPLY_TEXT; reply->text = "OK stop\n"; return; }
@@ -239,6 +287,9 @@ void siggen_peer_prepare(siggen_peer_t *p, const siggen_command_t *c, uint64_t n
         reply->text = ok ? "OK release\n" : "ERR configure\n";
         return;
     }
+    if ((p->clock_armed || p->clock_restore_pending) &&
+        (c->kind == SIG_CMD_MASTER || c->kind == SIG_CMD_SLAVE || c->kind == SIG_CMD_START))
+        cancel(p);
     if (active(p)) { reply->kind = SIG_REPLY_TEXT; reply->text = "ERR busy\n"; return; }
     switch (c->kind) {
     case SIG_CMD_START:
@@ -269,6 +320,25 @@ void siggen_peer_prepare(siggen_peer_t *p, const siggen_command_t *c, uint64_t n
         p->hold_started = now;
         p->hold_duration_us = (uint64_t)c->value[1] * 1000U;
         p->hal.hold(p->hal.context, p->held_mask);
+        ++p->hold_count; break;
+    case SIG_CMD_HOLD_SDA_CLOCKS:
+        p->running = false;
+        p->clock_requested = (uint8_t)c->value[0];
+        p->clock_observed = 0;
+        p->clock_armed = true;
+        p->clock_restore_pending = false;
+        p->clock_restore_error = false;
+        p->clock_result = SIG_CLOCK_ARMED;
+        p->held_mask = 2;
+        p->hold_started = now;
+        p->hold_duration_us = c->value[1];
+        next_clock_generation(p);
+        if (p->hal.hold_sda_clocks == NULL || !p->hal.hold_sda_clocks(p->hal.context, p->clock_generation)) {
+            siggen_peer_stop(p);
+            p->clock_result = SIG_CLOCK_ERROR;
+            reply->kind = SIG_REPLY_TEXT; reply->text = "ERR clock arm; released\n";
+            return;
+        }
         ++p->hold_count; break;
     case SIG_CMD_TABLE_FILL:
         memset(p->table, (int)c->value[0], sizeof(p->table)); break;

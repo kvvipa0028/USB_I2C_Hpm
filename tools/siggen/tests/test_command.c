@@ -24,6 +24,12 @@ int main(void)
     ok("start", SIG_CMD_START); ok("release", SIG_CMD_RELEASE); ok("slave 0x08 1000000", SIG_CMD_SLAVE);
     assert(siggen_command_parse("table write 0x10 00aAff", &c) && c.data_len == 3U && c.data[1] == 0xaaU);
     assert(siggen_command_parse("hold both 5000", &c) && c.value[0] == 3U && c.value[1] == 5000U);
+    assert(siggen_command_parse("hold_sda_clocks 9 1", &c) && c.kind == SIG_CMD_HOLD_SDA_CLOCKS && c.value[1] == 1U);
+    ok("hold_sda_clocks 9 5000000", SIG_CMD_HOLD_SDA_CLOCKS);
+    bad("hold_sda_clocks 8 1000"); bad("hold_sda_clocks 10 1000");
+    bad("hold_sda_clocks 9 0"); bad("hold_sda_clocks 9 5000001");
+    bad("hold_sda_clocks 9 -1"); bad("hold_sda_clocks 9 4294967296");
+    bad("hold_sda_clocks 9 1000 extra"); bad("hold_sda_clocks 9");
     ok("table read 255 1", SIG_CMD_TABLE_READ); ok("nack data 1", SIG_CMD_NACK_DATA);
     assert(siggen_command_parse("nack data 256", &c) && c.value[0] == 256U);
     {
