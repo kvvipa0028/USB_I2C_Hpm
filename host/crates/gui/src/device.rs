@@ -4,15 +4,17 @@
 use eframe::egui;
 use usb_i2c::bridge::DeviceInfo;
 
-use crate::i2c;
 use crate::nav;
 use crate::theme;
 use crate::widgets::{self, Tone};
+use usb_i2c::proto::Capabilities;
 
 pub struct Conn {
     pub serial: String,
     /// The PING line, e.g. `protocol 1 firmware "usb_i2c 0.1"`.
     pub firmware: String,
+    pub capabilities: Capabilities,
+    pub offline: bool,
 }
 
 #[derive(Default)]
@@ -45,7 +47,7 @@ impl Devices {
     pub fn can_send(&self) -> bool {
         self.conn
             .as_ref()
-            .is_some_and(|c| self.list.iter().any(|d| d.serial == c.serial))
+            .is_some_and(|c| c.offline || self.list.iter().any(|d| d.serial == c.serial))
     }
 
     /// One bridge at a time. Even reopening the same serial needs an explicit
@@ -76,6 +78,9 @@ impl Devices {
     /// row is selected for a later connection.
     fn field_text(&self) -> String {
         if let Some(c) = &self.conn {
+            if c.offline {
+                return "离线测试设备 · 双端口模型".into();
+            }
             return self
                 .list
                 .iter()
@@ -122,6 +127,7 @@ impl Link {
 pub enum Action {
     Refresh,
     Connect(String),
+    ConnectOffline,
     Disconnect,
 }
 
@@ -159,9 +165,13 @@ pub fn top_bar(ui: &mut egui::Ui, dev: &mut Devices, busy: bool, link: Link) -> 
         });
 
         if let Some(c) = &dev.conn {
-            let (proto, fw) = parse_ping(&c.firmware).unwrap_or(("?", &c.firmware));
-            widgets::badge(ui, &format!("固件 {fw} · 协议 {proto}"), Tone::Neutral)
-                .on_hover_text(&c.firmware);
+            if c.offline {
+                widgets::badge(ui, "离线 · 未发 USB", Tone::Amber);
+            } else {
+                let (proto, fw) = parse_ping(&c.firmware).unwrap_or(("?", &c.firmware));
+                widgets::badge(ui, &format!("固件 {fw} · 协议 {proto}"), Tone::Neutral)
+                    .on_hover_text(&c.firmware);
+            }
         }
 
         widgets::trailing(ui, 30.0, |ui| {
@@ -220,7 +230,7 @@ pub fn page(
         ui,
         "设备连接",
         Some((link.text(), link.tone())),
-        "选择一块 usb_i2c，再点连接。连接时用 PING 读回固件版本。连接其他设备前，先点断开。",
+        "连接后查询固件与实际能力。没有开发板时可连接离线模型；离线结果不代表上板验收。",
         |ui| {
             if widgets::action_button(ui, !busy, "刷新").clicked() {
                 action = Some(Action::Refresh);
@@ -246,6 +256,10 @@ pub fn page(
             ui.add_space(6.0);
         }
         ui.horizontal(|ui| {
+            if widgets::action_button(ui, !busy && dev.conn.is_none(), "连接离线测试设备").clicked()
+            {
+                action = Some(Action::ConnectOffline);
+            }
             if let Some(a) = connect_buttons(ui, dev, dev.connect_target(), busy) {
                 action = Some(a);
             }
@@ -277,15 +291,46 @@ pub fn page(
         widgets::field_row(ui, "协议版本", false, |ui| {
             ui.label(ping.map_or("—", |(p, _)| p));
         });
-        widgets::field_row(ui, "端口", false, |ui| {
-            widgets::fixed_value(ui, "I2C0 · 主机", i2c::FIXED_PORT);
-        });
-        widgets::field_row(ui, "速率", false, |ui| {
-            widgets::fixed_value(ui, "100 kHz", i2c::FIXED_RATE);
-        });
-        widgets::field_row(ui, "单次传输", true, |ui| {
-            ui.label("写、读各最多 256 字节");
-        });
+        if let Some(c) = &dev.conn {
+            widgets::field_row(ui, "数据来源", false, |ui| {
+                ui.label(if c.offline {
+                    "离线内存模型，不产生 USB/I2C 信号"
+                } else {
+                    "USB 设备能力回复"
+                });
+            });
+            widgets::field_row(ui, "扩展协议", false, |ui| {
+                ui.label(
+                    c.capabilities
+                        .extension_version
+                        .map_or("legacy v1".into(), |v| format!("P0 extension {v}")),
+                );
+            });
+            widgets::field_row(ui, "端口", false, |ui| {
+                ui.label(format!("{} 路主机端口", c.capabilities.port_count));
+            });
+            widgets::field_row(ui, "速率范围", false, |ui| {
+                ui.label(format!(
+                    "{}–{} Hz",
+                    c.capabilities.min_speed_hz, c.capabilities.max_speed_hz
+                ));
+            });
+            widgets::field_row(ui, "单次传输", true, |ui| {
+                ui.label(format!("写、读各最多 {} 字节", c.capabilities.max_transfer));
+            });
+            widgets::note(
+                ui,
+                if c.offline {
+                    "模型：CH0/CH1 各有独立的 0x50 EEPROM（256 B），写入首字节为偏移，表尾回绕；其他地址返回 NACK。断开后数据重置。速率仅检查参数，不模拟波形或时序。"
+                } else if c.capabilities.extension_version.is_none() {
+                    "旧固件兼容模式：仅 CH0、100 kHz、基本读写。CH1 与可调速率未开放。"
+                } else {
+                    "能力来自设备报告；实际频率、两路波形重叠与故障隔离仍需上板测量。"
+                },
+            );
+        } else {
+            widgets::note(ui, "连接后显示设备能力；未连接时不推断端口或速率支持。");
+        }
     });
     action
 }
@@ -383,6 +428,8 @@ mod tests {
         d.conn = Some(Conn {
             serial: "A".into(),
             firmware: "protocol 1 firmware \"usb_i2c 0.1\"".into(),
+            capabilities: Capabilities::legacy(),
+            offline: false,
         });
         assert!(d.can_send());
         assert_eq!(d.link(false, false), Link::On);
@@ -444,5 +491,15 @@ mod tests {
         d.set_list(vec![dev("C")]);
         assert_eq!(d.selected, 0);
         assert_eq!(device_label(&dev("A")), "A   USB High");
+    }
+    #[test]
+    fn offline_connection_does_not_depend_on_usb_enumeration() {
+        let mut d = open_a();
+        d.conn.as_mut().unwrap().offline = true;
+        d.set_list(Vec::new());
+        assert!(d.can_send());
+        assert_eq!(d.link(false, false), Link::On);
+        assert!(d.field_text().contains("离线"));
+        assert!(d.connect_target().is_none());
     }
 }
