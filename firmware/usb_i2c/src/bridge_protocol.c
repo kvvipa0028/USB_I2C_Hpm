@@ -178,7 +178,9 @@ bool bridge_protocol_poll(bridge_protocol_t *p)
             uint16_t n = p->result[i].status == BRIDGE_OK ? p->transfer[i].read_len : 0;
             out[pos] = p->transfer[i].port; out[pos + 1] = p->result[i].status;
             put16(out + pos + 2, n); put32(out + pos + 4, p->result[i].hpm_status);
-            memcpy(out + pos + 8, p->data[i], n); pos += 8U + n;
+            memcpy(out + pos + 8, p->data[i], n);
+            /* Preflight bounds two entries to 2 + 2 * (8 + 240) bytes. */
+            pos = (uint16_t)(pos + 8U + n);
         }
         finish(p, BRIDGE_OK, 0, pos);
     } else if (p->command == 0x17 && (p->result[0].status == BRIDGE_OK || p->result[0].status == BRIDGE_NACK)) {

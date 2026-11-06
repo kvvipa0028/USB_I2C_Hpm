@@ -117,7 +117,9 @@ static void transfer_tests(void)
 }
 static uint32_t batch(uint16_t w0,uint16_t r0,uint16_t w1,uint16_t r1)
 {
-    uint32_t n=request(0x12,0,22+w0+w1,18+r0+r1,512);
+    uint32_t wlen=22U+w0+w1, rlen=18U+r0+r1;
+    assert(wlen<=UINT16_MAX && rlen<=UINT16_MAX);
+    uint32_t n=request(0x12,0,(uint16_t)wlen,(uint16_t)rlen,512);
     req[8]=2; uint32_t pos=10;
     for(unsigned i=0;i<2;++i) {
         uint16_t w=i?w1:w0, r=i?r1:r0;

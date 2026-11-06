@@ -3,6 +3,7 @@
 #include "i2c_deadline.h"
 #include "i2c_recovery.h"
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -26,8 +27,8 @@ static void timing_tests(void)
             assert((uint64_t)t.actual_hz * 100 <= (uint64_t)rates[r] * 105 &&
                    (uint64_t)t.actual_hz * 100 >= (uint64_t)rates[r] * 95);
             assert(t.high <= 511 && t.high > t.spike && t.high > t.hold);
-            uint64_t high = 2 + (2 + t.spike + t.high) * (t.multiplier + 1U);
-            uint64_t low = 2 + (2 + t.spike + t.high * t.ratio) * (t.multiplier + 1U);
+            uint64_t high = 2U + (UINT64_C(2) + t.spike + t.high) * (t.multiplier + 1U);
+            uint64_t low = 2U + (UINT64_C(2) + t.spike + (uint64_t)t.high * t.ratio) * (t.multiplier + 1U);
             uint64_t min_h = rates[r] <= 100000 ? 4000 : rates[r] <= 400000 ? 600 : 260;
             uint64_t min_l = rates[r] <= 100000 ? 4700 : rates[r] <= 400000 ? 1300 : 500;
             assert(high * 1000000000 >= clocks[c] * min_h);
@@ -36,7 +37,7 @@ static void timing_tests(void)
         }
         for (uint32_t hz = 10000; hz <= 1000000; hz += 997) {
             bool ok = bridge_i2c_timing(clocks[c], hz, &t);
-            if (!ok) fprintf(stderr, "no timing: clock=%u hz=%u\n", clocks[c], hz);
+            if (!ok) fprintf(stderr, "no timing: clock=%" PRIu32 " hz=%" PRIu32 "\n", clocks[c], hz);
             assert(ok);
             assert(t.actual_hz >= 10000 && t.actual_hz <= 1000000);
         }
