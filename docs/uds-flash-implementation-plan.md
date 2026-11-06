@@ -104,7 +104,8 @@ flowchart TB
 
 ```rust
 pub trait IsoTp {
-    /// 发送一个完整 PDU；Ok 带设备 µs 时间戳，表示最后一帧已交给 CAN 控制器。
+    /// 发送一个完整 PDU；Ok 带设备 µs 时间戳，表示最后一帧已在 CAN 总线上发送完成（与 `ISOTP_SEND` 一致），
+    /// 不是仅交给控制器排队。会话层从这个时刻开始计 P2。
     fn send(&mut self, pdu: &[u8], functional: bool, timeout: Duration) -> Result<u32, TpError>;
     /// 等待一个完整 PDU（带设备 µs 时间戳）；Ok(None) 表示超时没有数据。
     fn recv(&mut self, timeout: Duration) -> Result<Option<(u32, Vec<u8>)>, TpError>;
@@ -154,10 +155,10 @@ pub trait IsoTp {
 每个段依次执行 `34` → 多次 `36` → `37`：
 
 1. 发 `34`：dataFormatIdentifier（默认 `0x00`）、addressAndLengthFormatIdentifier（由流程指定，例如 `0x44`）、地址、长度。
-2. 从 `74` 响应中读出 maxNumberOfBlockLength。按 ISO 14229-1，这个长度包含 SID 和块序号。每块数据长度 = min(maxNumberOfBlockLength − 2, 4095 − 2, 流程上限)。
+2. 从 `74` 响应中读出 maxNumberOfBlockLength。按 ISO 14229-1，这个长度包含 SID 和块序号。每块数据长度 = min(maxNumberOfBlockLength − 2, 4095 − 2, 流程上限)。maxNumberOfBlockLength < 3 视为无效响应，下载失败；流程上限也必须至少留 1 字节数据，否则检查阶段拒绝。
 3. `36` 的块序号从 `0x01` 开始，`0xFF` 之后回到 `0x00`；响应必须回显同一个序号。每收到一个正响应，就发一次“已确认字节”事件。
 4. 收到 `77` 后，该段才算完成。
-5. 遇到 NRC 0x73 / 0x71 / 0x72 / 0x24 或超时：立即失败，记下“已擦除区域、已确认字节、在途块”。只有流程显式声明且 ECU 规范允许时，才按同一序号重发上一块（默认关闭，最多 1 次）。
+5. 遇到 NRC 0x73 / 0x71 / 0x72 / 0x24：立即失败，记下“已擦除区域、已确认字节”。`36` / `37` 超时或 `Tp(Link)`：结论为“结果未知”（6.4），在途块列入 `unconfirmed`，不自动重放。只有流程显式声明且 ECU 规范允许时，才按同一序号重发上一块（默认关闭，最多 1 次）。
 
 ### 6.3 停止
 
