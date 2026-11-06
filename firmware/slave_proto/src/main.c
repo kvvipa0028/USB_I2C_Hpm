@@ -17,7 +17,9 @@
 #define SLV_I2C   BOARD_APP_I2C_BASE
 #define SLV_IRQ   BOARD_APP_I2C_IRQ
 #define SLV_ADDR  0x50U
-#define SLV_MODE  i2c_mode_normal   /* normal = 100k, fast = 400k; match BUS_MODE in slave_test */
+#ifndef SLV_MODE
+#define SLV_MODE  i2c_mode_normal   /* normal = 100k, fast = 400k, fast_plus = 1M */
+#endif                            /* match BUS_MODE in slave_test */
 
 volatile struct {
     uint32_t magic;      /* 0x51A7E001 = slave initialized */

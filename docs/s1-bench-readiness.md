@@ -18,7 +18,7 @@ SDK 本地核对为 `1.13.0 @ ccc5ec46`。`drivers/inc/hpm_i2c_drv.h` 有 `i2c_m
 ## 2. 无硬件时的工作与完成边界
 
 1. 固定每组构建的仓库提交、SDK 提交、编译器版本、release 配置、宏值及 ELF 摘要；在独立构建目录生成三档主从镜像，不覆盖历史证据。
-2. 将速率/轮数/对端上拉变成受校验的构建参数，保留当前默认值；检查配置确实进入编译命令和结果字段，不能只传一个被 CMake 忽略的 `-D`。
+2. 两个原型已提供受校验的速率/轮数/对端上拉 CMake 参数（第 4 节），保留原默认值；检查配置确实进入编译命令和结果字段，不能只传一个被 CMake 忽略的 `-D`。
 3. 保留 9-word 结果布局。当前 `first_info` 用高 16 位保存首错轮号，长轮数必须受限或另行设计完整轮号字段；不得让首错信息静默截断。
 4. 为自定义频率建立纯计算测试输入/预期、整数溢出/无解拒绝测试和寄存器范围检查；最终算法需与实际时钟、SDK/芯片时序公式核对。这是后续实现入口，本手册不宣称算法已完成。
 5. 准备下述台架矩阵、仪器设置和空白记录。无设备运行脚本时写 `PENDING_HARDWARE`/SKIP，不写 PASS。
@@ -44,22 +44,40 @@ SDK 本地核对为 `1.13.0 @ ccc5ec46`。`drivers/inc/hpm_i2c_drv.h` 有 `i2c_m
 
 ## 4. 构建与符号准备
 
-在仓库根目录执行构建，所有性能目标显式使用 `-DCMAKE_BUILD_TYPE=release`。以下先给当前默认 100k 冒烟的独立目录示例；三档配置应使用本项目正式暴露并校验的构建选项，不通过修改 SDK 来切换档位。
+在仓库根目录执行构建，所有性能目标显式使用 `-DCMAKE_BUILD_TYPE=release`。可直接运行只构建脚本：
+
+```sh
+tools/s1-build-matrix.sh
+tools/s1-build-matrix.sh --rounds 1000 --peer-pullup 1 --jobs 4
+```
+
+[s1-build-matrix.sh](../tools/s1-build-matrix.sh) 为 100k/400k/1M 各构建一个 EVK 从机与 EVKMini 主机，共六个 release 目标；没有烧录或 OpenOCD 调用。默认在已忽略的 `build/s1-matrix/run-*` 新建本次目录，不覆盖历史结果。`--build-root DIR` 可另选父目录。证据包括 `environment.txt`、`source-sha256.txt`、`summary.tsv`、各目标 configure/build 日志、`compile_commands.json`、symbols 和 ELF SHA-256；`BUILT` 只表示 target 编译，`hardware_status` 始终为 `PENDING_HARDWARE`。
+
+| 工程 | CMake 参数 | 允许值/默认值 |
+| --- | --- | --- |
+| `firmware/slave_proto` | `SLV_MODE` | `i2c_mode_normal`（默认）、`i2c_mode_fast`、`i2c_mode_fast_plus` |
+| `tools/slave_test` | `BUS_MODE` | 同上，必须与从机匹配 |
+| `tools/slave_test` | `ROUNDS` | 十进制 1–65535，不带前导零；默认 200，保持 9-word 结果布局 |
+| `tools/slave_test` | `PEER_PULLUP` | 0/1，默认 0；不是对实际外部上拉的声明 |
+
+`ROUNDS` 上限只保证首错轮号不截断。现有 `elapsed_us` 为 32 位，连续测试超过约 71 分 35 秒会回绕；长轮数测试应另用外部计时记录总时长，不能直接用该字段计算吞吐量或证明耐久运行时长。
+
+非法值在 configure 阶段失败。参数只进入对应 app 的编译定义；不修改 SDK，不改变产品 bridge。单独构建 100k 示例：
 
 ```sh
 source tools/env.sh
-cmake -S firmware/slave_proto -B firmware/slave_proto/build-s1-100k -GNinja -DBOARD=hpm6300evk -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release
-cmake --build firmware/slave_proto/build-s1-100k
-cmake -S tools/slave_test -B tools/slave_test/build-s1-100k -GNinja -DBOARD=hpm6750evkmini -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release
-cmake --build tools/slave_test/build-s1-100k
+cmake -S firmware/slave_proto -B build/s1-100k/slave -GNinja -DBOARD=hpm6300evk -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release -DSLV_MODE=i2c_mode_normal
+cmake --build build/s1-100k/slave
+cmake -S tools/slave_test -B build/s1-100k/peer -GNinja -DBOARD=hpm6750evkmini -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release -DBUS_MODE=i2c_mode_normal -DROUNDS=200 -DPEER_PULLUP=0
+cmake --build build/s1-100k/peer
 ```
 
 构建结束后从**该次 ELF**取符号，禁止复制旧地址：
 
 ```sh
-"$GNURISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-nm" -S --defined-only firmware/slave_proto/build-s1-100k/output/demo.elf | rg ' g_(slave|table)$'
-"$GNURISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-nm" -S --defined-only tools/slave_test/build-s1-100k/output/demo.elf | rg ' g_(result|exp)$'
-shasum -a 256 firmware/slave_proto/build-s1-100k/output/demo.elf tools/slave_test/build-s1-100k/output/demo.elf
+"$GNURISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-nm" -S --defined-only build/s1-100k/slave/output/demo.elf | rg ' g_(slave|table)$'
+"$GNURISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-nm" -S --defined-only build/s1-100k/peer/output/demo.elf | rg ' g_(result|exp)$'
+shasum -a 256 build/s1-100k/slave/output/demo.elf build/s1-100k/peer/output/demo.elf
 ```
 
 同时保存 map、CMakeCache、编译命令或 `ninja -t commands` 输出。编译失败和缺工具分别报告，不生成通过记录。已有 `build/` 中的旧 ELF 不能当作本次新配置产物。
