@@ -122,6 +122,12 @@
 - 字体子集：示例包里的中文也显示在界面上，`subset.sh` 与 `fonts::tests::subset_covers_ui_text` 现在同时扫描 `fixtures/` 下的 `.udsmock`。
 - 未做（P2 及以后）：真实执行后端与 IPC 进程、CAN / ISO-TP / UDS 通信、读取 ECU 标识与目标匹配（§5.1 第 4 步）、镜像内容与地址/签名检查、算法组件、后端失联看门狗、报告持久化与导出、真机/台架验证。
 
+### JSON 流程清单解析层（`uds-flow-manifest` v1，PR A）
+
+- `flow/manifest.rs` 解析并检查裸 JSON 清单（`.udsflow.json`，不支持 ZIP），问题项沿用 `api::Issue` 的「缺少依赖 / 不支持」。它和 `.udsmock` 一样是项目自拟的**模拟**包格式，**不是 ODX**，也不代表首个真实流程资产（D01）。
+- 只做解析，还没有接入：`MockBackend`、界面「来源」和导入仍只认 `.udsmock`，`.udsmock` 保留不变。不读取镜像文件，`sha256` 只检查格式；`script` / `hooks` / `url` / `frames` / `eval` 和未知键都记「不支持」，只记录，不执行，也不拉取。含 `simulate` 的包只给模拟后端，`parse` 收到非模拟模式时记「不支持」。
+- 本 PR 新增依赖 `serde`、`serde_json`（仅 gui crate；`Cargo.lock` 新增 `serde_json`、`itoa`、`zmij`）。字体子集已按新增文案重新生成。示例 `fixtures/uds/*.udsflow.json` 与同名 `.udsmock` 等价。
+
 ## 中文字体
 
 - 内置 `assets/fonts/NotoSansSC-UI.otf`：Noto Sans CJK SC Regular 按 `src/` 实际用到的字（加常用中文标点）裁成子集，约 205 KB / 556 个字符；许可证 SIL OFL 1.1，见同目录 `OFL.txt`。
@@ -171,5 +177,6 @@ src/flow.rs        UDS P1 宿主路径模块入口、FNV-1a 64
 src/flow/api.rs    版本化后端接口（Backend trait 与数据类型）
 src/flow/host.rs   宿主任务管理：状态机、运行快照、事件归档、导入读取
 src/flow/mock.rs   模拟后端与 uds-mock-fixture v1 解析
+src/flow/manifest.rs  uds-flow-manifest v1 JSON 清单解析与检查（尚未接入后端）
 fixtures/uds/      模拟流程包示例（single / multi / blocked）与格式说明
 ```

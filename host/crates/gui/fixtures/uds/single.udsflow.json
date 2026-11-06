@@ -1,0 +1,36 @@
+{
+  "format": "uds-flow-manifest",
+  "version": 1,
+  "package": "演示包 · 单入口",
+  "notes": ["由 single.udsmock 等价迁移；仅模拟"],
+  "files": [
+    { "path": "app.bin", "role": "image", "media": "bin" },
+    { "path": "flash_driver.bin", "role": "driver", "media": "bin" }
+  ],
+  "entries": [
+    {
+      "id": "app",
+      "title": "应用程序刷写（模拟）",
+      "ecu": "DEMO-ECU-A · 演示 Bootloader",
+      "images": [
+        { "file": "app.bin", "base": "0x00010000", "len": 262144 }
+      ],
+      "needs": ["flash_driver.bin"],
+      "params": [
+        { "id": "req_id", "label": "请求 ID", "editable": false, "value": "0x7E0" },
+        { "id": "resp_id", "label": "响应 ID", "editable": false, "value": "0x7E8" },
+        { "id": "p2", "label": "响应超时 P2", "unit": "ms", "editable": true, "lo": 1, "hi": 5000, "default": 50 },
+        { "id": "p2x", "label": "扩展超时 P2*", "unit": "ms", "editable": true, "lo": 100, "hi": 60000, "default": 5000 }
+      ],
+      "steps": [
+        { "kind": "read_id", "label": "读取 ECU 标识" },
+        { "kind": "session", "label": "进入编程会话" },
+        { "kind": "security", "label": "安全访问" },
+        { "kind": "erase", "label": "擦除下载区域" },
+        { "kind": "download", "label": "分块下载应用程序" },
+        { "kind": "verify", "label": "ECU 完整性校验" },
+        { "kind": "reset", "label": "复位" }
+      ]
+    }
+  ]
+}

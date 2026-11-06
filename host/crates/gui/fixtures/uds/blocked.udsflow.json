@@ -1,0 +1,26 @@
+{
+  "format": "uds-flow-manifest",
+  "version": 1,
+  "package": "演示包 · 含不支持项",
+  "notes": ["期望：Missing flash_driver；Unsupported requires/script/checksum_vendor；阻止准备"],
+  "files": [
+    { "path": "app.bin", "role": "image", "media": "bin" }
+  ],
+  "entries": [
+    {
+      "id": "app",
+      "title": "应用程序刷写（含厂家扩展）",
+      "ecu": "DEMO-ECU-C",
+      "images": [{ "file": "app.bin", "base": "0x00010000", "len": 262144 }],
+      "needs": ["flash_driver.bin"],
+      "requires": ["otx-extension:com.example.SecureFlash"],
+      "script": "post_flash.js",
+      "steps": [
+        { "kind": "session", "label": "进入编程会话" },
+        { "kind": "security", "label": "安全访问" },
+        { "kind": "checksum_vendor", "label": "厂家专用校验" },
+        { "kind": "download", "label": "分块下载应用程序" }
+      ]
+    }
+  ]
+}

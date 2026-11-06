@@ -51,8 +51,9 @@ pub const FIXTURES: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// Step kinds the model knows, and whether each changes the target.
-const KINDS: [(&str, bool); 7] = [
+/// Step kinds the model knows, and whether each changes the target. The
+/// JSON manifest (`manifest`) checks its steps against the same list.
+pub(super) const KINDS: [(&str, bool); 7] = [
     ("read_id", false),
     ("session", false),
     ("security", false),
