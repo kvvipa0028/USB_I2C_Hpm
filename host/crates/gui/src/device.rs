@@ -7,6 +7,7 @@ use usb_i2c::bridge::DeviceInfo;
 use crate::nav;
 use crate::theme;
 use crate::widgets::{self, Tone};
+use usb_i2c::control::ControlCapabilities;
 use usb_i2c::proto::Capabilities;
 
 pub struct Conn {
@@ -15,6 +16,7 @@ pub struct Conn {
     pub firmware: String,
     pub capabilities: Capabilities,
     pub offline: bool,
+    pub control_capabilities: Vec<ControlCapabilities>,
 }
 
 #[derive(Default)]
@@ -307,7 +309,7 @@ pub fn page(
                 );
             });
             widgets::field_row(ui, "端口", false, |ui| {
-                ui.label(format!("{} 路主机端口", c.capabilities.port_count));
+                ui.label(format!("{} 路 I2C 端口", c.capabilities.port_count));
             });
             widgets::field_row(ui, "速率范围", false, |ui| {
                 ui.label(format!(
@@ -318,6 +320,35 @@ pub fn page(
             widgets::field_row(ui, "单次传输", true, |ui| {
                 ui.label(format!("写、读各最多 {} 字节", c.capabilities.max_transfer));
             });
+            for cap in &c.control_capabilities {
+                widgets::field_row(ui, &format!("CH{} 控制", cap.port), false, |ui| {
+                    let mut features = Vec::new();
+                    if cap.supports_role_config {
+                        features.push("主从配置");
+                    }
+                    if cap.supports_table {
+                        features.push("从机表");
+                    }
+                    if cap.supports_probe {
+                        features.push("扫描");
+                    }
+                    if cap.supports_recover {
+                        features.push("恢复");
+                    }
+                    ui.label(if features.is_empty() {
+                        "不支持扩展控制".into()
+                    } else {
+                        features.join(" / ")
+                    });
+                });
+                widgets::field_row(ui, &format!("CH{} 前端", cap.port), false, |ui| {
+                    ui.label(if cap.supports_frontend_get {
+                        "支持查询，实测值以有效标志为准"
+                    } else {
+                        "Unsupported · 无有效电压测量"
+                    });
+                });
+            }
             widgets::note(
                 ui,
                 if c.offline {
@@ -430,6 +461,7 @@ mod tests {
             firmware: "protocol 1 firmware \"usb_i2c 0.1\"".into(),
             capabilities: Capabilities::legacy(),
             offline: false,
+            control_capabilities: Vec::new(),
         });
         assert!(d.can_send());
         assert_eq!(d.link(false, false), Link::On);

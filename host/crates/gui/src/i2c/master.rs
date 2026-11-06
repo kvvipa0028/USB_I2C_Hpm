@@ -1,16 +1,10 @@
-//! 主机 tab. Capability-gated port and rate, address, register address,
-//! and read length, then the
-//! transaction, its result, and this session's transaction log.
-//!
-//! Real transfers use the bridge's one I2C command, once or on a loop
-//! (循环 sends the same transfer again each period until switched off or a
-//! transfer fails). 扫描地址 and 总线恢复 have no command: they insert rows
-//! marked 演示 into the log, which the counts leave out.
+//! Capability-gated I2C master transactions and their real/offline records.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use eframe::egui;
+use usb_i2c::control::PortRole;
 use usb_i2c::proto::{Capabilities, MAX_XFER};
 
 use super::parse::{
@@ -25,9 +19,6 @@ use crate::worker::{Op, Transfer};
 const LOG_MAX: usize = 200;
 /// Register address width: true is 16 bit (sent high byte first).
 const REG_WIDTHS: [(bool, &str); 2] = [(false, "8 bit"), (true, "16 bit")];
-/// Addresses the demo scan reports.
-const DEMO_SCAN: [u8; 3] = [0x48, 0x50, 0x68];
-const DEMO_HOVER: &str = "本地演示：插入示例行，不发 USB（当前固件无此命令）";
 
 pub struct Record {
     port: u8,
@@ -41,16 +32,11 @@ pub struct Record {
     wdata: Vec<u8>,
     rlen: usize,
     result: Result<Vec<u8>, String>,
-    /// Set on rows the window made up (scan, bus recovery): what it stands for.
-    demo: Option<&'static str>,
 }
 
 impl Record {
     /// One line for the result card and the footer.
     pub fn summary(&self) -> String {
-        if let Some(what) = self.demo {
-            return format!("本地演示：{what} 0x{:02x}，未发 USB", self.addr);
-        }
         let prefix = format!(
             "{} CH{} · ",
             if self.offline { "离线" } else { "USB" },
@@ -81,8 +67,6 @@ struct Cfg {
     port: u8,
     speed_hz: String,
     addr: String,
-    /// UI-only preference, not sent to the bridge until its protocol supports it.
-    clock_stretching: bool,
     /// Register address sent before the write bytes; empty for none.
     reg: String,
     reg16: bool,
@@ -96,7 +80,6 @@ impl Default for Cfg {
             port: 0,
             speed_hz: "100000".into(),
             addr: "0x50".into(),
-            clock_stretching: true,
             reg: String::new(),
             reg16: false,
             read_len: "16".into(),
@@ -127,6 +110,8 @@ impl Cfg {
 pub struct Master {
     capabilities: Capabilities,
     offline: bool,
+    roles: [Option<PortRole>; 2],
+    role_required: [bool; 2],
     cfg: Cfg,
     saved: Saved<Cfg>,
     advanced: bool,
@@ -151,6 +136,8 @@ impl Default for Master {
         Self {
             capabilities: Capabilities::legacy(),
             offline: false,
+            roles: [None; 2],
+            role_required: [false; 2],
             cfg: Cfg::default(),
             saved: Saved::default(),
             advanced: false,
@@ -171,6 +158,8 @@ impl Master {
         self.stop_loop("连接操作，循环已停止");
         self.capabilities = capabilities.clone();
         self.offline = offline;
+        self.roles = [None; 2];
+        self.role_required = [false; 2];
         // Do not carry an unsupported draft over to a legacy connection.
         self.cfg.port = 0;
         self.cfg.speed_hz = capabilities.fixed_speed_hz.to_string();
@@ -178,9 +167,38 @@ impl Master {
         self.saved = Saved::default();
     }
 
+    pub(super) fn select_port(&mut self, port: u8) {
+        if self.cfg.port != port {
+            self.stop_loop("所选端口已改变，循环已停止");
+        }
+        self.cfg.port = port;
+    }
+
+    pub(super) fn set_role(&mut self, port: u8, role: Option<PortRole>, required: bool) {
+        if let Some(slot) = self.roles.get_mut(usize::from(port)) {
+            *slot = role;
+        }
+        if let Some(slot) = self.role_required.get_mut(usize::from(port)) {
+            *slot = required;
+        }
+        if self.cfg.port == port && !self.master_ready() {
+            self.stop_loop("端口主机角色未确认，循环已停止");
+        }
+    }
+
+    fn master_ready(&self) -> bool {
+        let port = usize::from(self.cfg.port);
+        matches!(self.roles.get(port), Some(Some(PortRole::Master)))
+            || (matches!(self.roles.get(port), Some(None))
+                && !self.role_required.get(port).copied().unwrap_or(true))
+    }
+
     /// Check the fields and build the transfer for `op`. A register
     /// address, if given, goes before the write bytes.
     pub fn transfer(&self, op: Op) -> Result<Transfer, String> {
+        if !self.master_ready() {
+            return Err("所选端口不是已确认的主机角色，请先读取或应用端口配置".into());
+        }
         let addr = parse_addr(&self.cfg.addr)?;
         // 读取 is a plain read, as the CLI's `read`: nothing is written first
         let wdata = match op {
@@ -249,7 +267,6 @@ impl Master {
             wdata: t.wdata,
             rlen: t.rlen,
             result,
-            demo: None,
         });
         &self.log[0]
     }
@@ -262,42 +279,6 @@ impl Master {
         }
         self.log.push_front(r);
         self.log.truncate(LOG_MAX);
-    }
-
-    /// 扫描地址 without a command: one demo row per example address.
-    fn demo_scan(&mut self, at: Duration) {
-        for (i, addr) in DEMO_SCAN.into_iter().enumerate() {
-            self.push(Record {
-                id: 0,
-                port: self.cfg.port,
-                speed_hz: 100_000,
-                offline: self.offline,
-                at: at + Duration::from_millis(i as u64),
-                op: Op::Write,
-                addr,
-                wdata: Vec::new(),
-                rlen: 0,
-                result: Ok(Vec::new()),
-                demo: Some("扫描应答"),
-            });
-        }
-    }
-
-    /// 总线恢复 without a command: one demo row.
-    fn demo_recover(&mut self, at: Duration) {
-        self.push(Record {
-            id: 0,
-            port: self.cfg.port,
-            speed_hz: 100_000,
-            offline: self.offline,
-            at,
-            op: Op::Write,
-            addr: 0,
-            wdata: Vec::new(),
-            rlen: 0,
-            result: Ok(Vec::new()),
-            demo: Some("总线恢复 · 9 个 SCL 脉冲"),
-        });
     }
 
     pub fn looping(&self) -> bool {
@@ -344,9 +325,9 @@ impl Master {
         self.log.iter().find(|r| r.id == id)
     }
 
-    /// Records that went over USB.
+    /// Explicit USB or offline operations recorded during this session.
     fn real(&self) -> impl Iterator<Item = &Record> {
-        self.log.iter().filter(|r| r.demo.is_none())
+        self.log.iter()
     }
 
     /// Shared fixture for App's queue-only connection lifecycle tests.
@@ -396,15 +377,7 @@ fn config(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) {
             ui.spacing_mut().item_spacing.y = 4.0;
             let c = &mut m.cfg;
             widgets::field_row(ui, "端口", false, |ui| {
-                ui.add_enabled_ui(!cx.busy && !m.looping, |ui| {
-                    egui::ComboBox::from_id_salt("master_port")
-                        .selected_text(format!("CH{} · 主机", c.port))
-                        .show_ui(ui, |ui| {
-                            for port in 0..m.capabilities.port_count {
-                                ui.selectable_value(&mut c.port, port, format!("CH{port} · 主机"));
-                            }
-                        });
-                });
+                ui.label(format!("CH{} · 使用上方所选端口", c.port));
             });
             widgets::field_row(ui, "速率", false, |ui| {
                 ui.add_enabled_ui(
@@ -424,11 +397,10 @@ fn config(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) {
                     "频率随每笔请求发送，实际波形需上板测量。"
                 },
             );
-            widgets::field_row(ui, "时钟延展", false, |ui| {
-                widgets::check(ui, &mut c.clock_stretching, "启用");
-                widgets::badge(ui, "仅设置", Tone::Neutral);
-            });
-            widgets::note(ui, "仅保存本窗口设置，尚未接入固件，不影响实际 I2C 通信。");
+            widgets::note(
+                ui,
+                "拉伸与整笔超时使用上方实际配置；每笔速率覆盖不修改默认配置。",
+            );
             widgets::field_row(ui, "目标地址", false, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut c.addr)
@@ -487,7 +459,7 @@ fn config(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) {
     );
 }
 
-/// Counts over this session's real transfers; demo rows are left out.
+/// Counts over this session's explicitly executed transfers.
 fn summary(ui: &mut egui::Ui, m: &Master) {
     let total = m.real().count();
     let acked = m.real().filter(|r| r.ok()).count();
@@ -506,7 +478,7 @@ fn summary(ui: &mut egui::Ui, m: &Master) {
         if m.offline {
             "当前连接：离线模型 · 记录保留来源标记"
         } else {
-            "记录按 USB / 离线标记 · 不含演示行"
+            "记录按 USB / 离线标记"
         },
     );
 }
@@ -554,7 +526,7 @@ fn compose(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
                 "当前从机把第一个字节当作寄存器表偏移。写后读：写完不发 STOP，重复 START 后读取。",
             );
             ui.horizontal(|ui| {
-                let on = cx.connected && !cx.busy;
+                let on = cx.connected && !cx.busy && m.master_ready();
                 let why = if cx.connected {
                     "上一个操作还在进行"
                 } else {
@@ -592,6 +564,9 @@ fn compose(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
                     widgets::muted(ui, "未连接");
                 }
             });
+            if !m.master_ready() {
+                widgets::error(ui, "所选端口主机角色未确认，读写已禁用。");
+            }
             if let Some((o, _)) = m.loop_op {
                 ui.horizontal(|ui| {
                     widgets::badge(ui, &format!("循环中 · {}", o.label()), Tone::Green);
@@ -628,10 +603,6 @@ fn result(ui: &mut egui::Ui, m: &Master) {
         "结果",
         |ui| {
             let Some(r) = rec else { return };
-            if r.demo.is_some() {
-                widgets::badge(ui, "演示", Tone::Neutral);
-                return;
-            }
             if let Ok(data) = &r.result {
                 if !data.is_empty() && widgets::quiet_button(ui, true, "复制 HEX").clicked() {
                     ui.ctx().copy_text(to_hex(data));
@@ -653,20 +624,6 @@ fn result(ui: &mut egui::Ui, m: &Master) {
                 );
                 return;
             };
-            if r.demo.is_some() {
-                ui.label(
-                    egui::RichText::new(format!("#{}  {}  ·  {}", r.id, clock(r.at), r.summary()))
-                        .size(11.5)
-                        .color(t.muted),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "这是示例行：当前固件没有扫描与总线恢复命令，结果不代表总线上的器件。",
-                    )
-                    .color(t.fg2),
-                );
-                return;
-            }
             ui.label(
                 egui::RichText::new(format!(
                     "#{}  {}  ·  {}  ·  0x{:02x}  ·  写 {} B  ·  读 {} B",
@@ -716,7 +673,7 @@ fn result(ui: &mut egui::Ui, m: &Master) {
     );
 }
 
-fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
+fn log(ui: &mut egui::Ui, m: &mut Master, _now: Duration) {
     let t = theme::of(ui);
     let mut clear = false;
     let mut pick = None;
@@ -749,18 +706,6 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
                             None => Some(m.next_id - 1),
                         };
                     }
-                    if widgets::quiet_button(ui, true, "总线恢复 · 演示")
-                        .on_hover_text(DEMO_HOVER)
-                        .clicked()
-                    {
-                        m.demo_recover(now);
-                    }
-                    if widgets::quiet_button(ui, true, "扫描地址 · 演示")
-                        .on_hover_text(DEMO_HOVER)
-                        .clicked()
-                    {
-                        m.demo_scan(now);
-                    }
                 });
             });
             if m.log.is_empty() {
@@ -778,66 +723,43 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for r in m.log.iter().filter(|r| m.frozen.is_none_or(|f| r.id <= f)) {
-                        let cells = match r.demo {
-                            Some(what) => {
-                                let op = if what.starts_with("扫描") {
-                                    "扫描"
-                                } else {
-                                    "总线恢复"
-                                };
-                                let addr = if r.addr == 0 {
-                                    "—".to_owned()
-                                } else {
-                                    format!("0x{:02x}", r.addr)
-                                };
-                                [
-                                    (clock(r.at), t.muted, true),
-                                    (op.to_owned(), t.fg2, false),
-                                    (addr, t.fg2, true),
-                                    ("—".to_owned(), t.faint, true),
-                                    ("—".to_owned(), t.faint, true),
-                                    ("演示".to_owned(), t.accent, false),
-                                ]
-                            }
-                            None => {
-                                let (res, color) = match &r.result {
-                                    Ok(_) => ("ACK", t.green),
-                                    Err(e) => (short_error(e), t.red),
-                                };
-                                let read = match &r.result {
-                                    Ok(d) if !d.is_empty() => preview(d),
-                                    _ if r.rlen > 0 => format!("({} B)", r.rlen),
-                                    _ => "—".into(),
-                                };
-                                let write = if r.wdata.is_empty() {
-                                    "—".into()
-                                } else {
-                                    preview(&r.wdata)
-                                };
-                                [
-                                    (clock(r.at), t.muted, true),
-                                    (
-                                        format!(
-                                            "{} CH{} {}",
-                                            if r.offline { "离线" } else { "USB" },
-                                            r.port,
-                                            r.op.label()
-                                        ),
-                                        t.fg,
-                                        false,
+                        let cells = {
+                            let (res, color) = match &r.result {
+                                Ok(_) => ("ACK", t.green),
+                                Err(e) => (short_error(e), t.red),
+                            };
+                            let read = match &r.result {
+                                Ok(d) if !d.is_empty() => preview(d),
+                                _ if r.rlen > 0 => format!("({} B)", r.rlen),
+                                _ => "—".into(),
+                            };
+                            let write = if r.wdata.is_empty() {
+                                "—".into()
+                            } else {
+                                preview(&r.wdata)
+                            };
+                            [
+                                (clock(r.at), t.muted, true),
+                                (
+                                    format!(
+                                        "{} CH{} {}",
+                                        if r.offline { "离线" } else { "USB" },
+                                        r.port,
+                                        r.op.label()
                                     ),
-                                    (format!("0x{:02x}", r.addr), t.fg, true),
-                                    (write, t.fg2, true),
-                                    (read, t.fg, true),
-                                    (res.to_owned(), color, false),
-                                ]
-                            }
+                                    t.fg,
+                                    false,
+                                ),
+                                (format!("0x{:02x}", r.addr), t.fg, true),
+                                (write, t.fg2, true),
+                                (read, t.fg, true),
+                                (res.to_owned(), color, false),
+                            ]
                         };
                         let resp = table.row(ui, &cells, m.selected == Some(r.id));
-                        let resp = match (&r.result, r.demo) {
-                            (_, Some(_)) => resp.on_hover_text(DEMO_HOVER),
-                            (Err(e), None) => resp.on_hover_text(e),
-                            (Ok(_), None) => resp,
+                        let resp = match &r.result {
+                            Err(error) => resp.on_hover_text(error),
+                            Ok(_) => resp,
                         };
                         if resp.clicked() {
                             pick = Some(r.id);
@@ -847,7 +769,7 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
             let left = if m.frozen.is_some() {
                 format!("已暂停显示 · 共 {count} 条，传输不受影响")
             } else {
-                "最新在上 · 点行查看结果 · 演示行不计入统计".to_owned()
+                "最新在上 · 点行查看结果".to_owned()
             };
             widgets::table_foot(ui, &left, &format!("最多 {LOG_MAX} 条"));
         },
@@ -939,20 +861,6 @@ mod tests {
     }
 
     #[test]
-    fn demo_rows_stay_out_of_the_counts() {
-        let mut m = Master::default();
-        m.demo_scan(Duration::ZERO);
-        m.demo_recover(Duration::ZERO);
-        assert_eq!(m.log.len(), 4);
-        assert_eq!(m.real().count(), 0);
-        assert!(m
-            .shown()
-            .unwrap()
-            .summary()
-            .starts_with("本地演示：总线恢复"));
-    }
-
-    #[test]
     fn loop_repeats_until_stopped() {
         let ms = Duration::from_millis;
         let mut m = Master {
@@ -1035,5 +943,26 @@ mod tests {
         m.cfg.port = 0;
         m.cfg.speed_hz = "400000".into();
         assert!(m.transfer(Op::Read).is_err());
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn role_changes_stop_loops_and_block_master_operations_until_confirmed() {
+        let mut master = Master::default();
+        master.arm_test_write_loop();
+        master.set_role(0, None, true);
+        assert!(!master.looping());
+        assert!(master.transfer(Op::Read).is_err());
+        master.set_role(0, Some(PortRole::Slave), true);
+        assert!(master.transfer(Op::Read).is_err());
+        master.set_role(0, Some(PortRole::Master), true);
+        assert!(master.transfer(Op::Read).is_ok());
+        master.arm_test_write_loop();
+        master.select_port(1);
+        assert!(!master.looping());
     }
 }

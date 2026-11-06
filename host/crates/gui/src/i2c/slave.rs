@@ -1,15 +1,14 @@
-//! 从机 tab: address, and the 256-byte register table as a hex grid.
-//! Nothing here reaches the device: the bridge protocol has no slave
-//! commands (set role, set address, read/write the table), so the table is
-//! edited in the window and starts all zero, as slave_proto's does after
-//! reset.
-
+//! Per-port slave-table drafts with explicit snapshots and CAS commits.
 use eframe::egui;
+use usb_i2c::control::{ControlCapabilities, ControlStatus, PortRole, PortState, TableSnapshot};
+use usb_i2c::device::DeviceError;
 
-use super::parse::{parse_addr, parse_bytes, to_hex};
-use super::{FIXED_PORT, NO_CMD};
+use super::parse::{parse_bytes, to_hex};
+use super::Ctx;
+use crate::local::{parse_hex, parse_num};
 use crate::theme;
 use crate::widgets::{self, Tone};
+use crate::worker::{ControlReply, ControlRequest};
 
 const SIZE: usize = 256;
 const OFF_W: f32 = 40.0;
@@ -18,25 +17,36 @@ const ROW_H: f32 = 22.0;
 const CHAR_W: f32 = 7.5;
 
 pub struct Slave {
-    addr: String,
-    table: [u8; SIZE],
-    /// What the table started from; cells that differ are marked as edited.
-    base: [u8; SIZE],
-    cursor: usize,
-    /// High nibble typed into the cursor cell, waiting for the low one.
-    nibble: Option<u8>,
-    value: String,
-    /// The cell whose 应用 failed; cleared when the cursor leaves it or the
-    /// input changes.
-    value_err: Option<usize>,
+    editors: [Editor; 2],
 }
-
 impl Default for Slave {
     fn default() -> Self {
         Self {
-            addr: "0x50".into(),
+            editors: std::array::from_fn(|_| Editor::default()),
+        }
+    }
+}
+
+struct Editor {
+    table: [u8; SIZE],
+    base: [u8; SIZE],
+    snapshot: Option<TableSnapshot>,
+    offset: String,
+    len: String,
+    cursor: usize,
+    nibble: Option<u8>,
+    value: String,
+    value_err: Option<usize>,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
             table: [0; SIZE],
             base: [0; SIZE],
+            snapshot: None,
+            offset: "0x00".into(),
+            len: "256".into(),
             cursor: 0,
             nibble: None,
             value: String::new(),
@@ -45,7 +55,7 @@ impl Default for Slave {
     }
 }
 
-impl Slave {
+impl Editor {
     fn edited(&self) -> usize {
         self.table
             .iter()
@@ -53,29 +63,23 @@ impl Slave {
             .filter(|(a, b)| a != b)
             .count()
     }
-
     fn move_by(&mut self, delta: isize) {
         self.nibble = None;
         self.cursor = (self.cursor as isize + delta).clamp(0, SIZE as isize - 1) as usize;
     }
-
-    /// Two hex digits make a byte; then the cursor moves on.
-    fn type_digit(&mut self, d: u8) {
+    fn type_digit(&mut self, digit: u8) {
         match self.nibble.take() {
-            None => self.nibble = Some(d),
+            None => self.nibble = Some(digit),
             Some(hi) => {
-                self.table[self.cursor] = (hi << 4) | d;
+                self.table[self.cursor] = (hi << 4) | digit;
                 self.cursor = (self.cursor + 1).min(SIZE - 1);
             }
         }
     }
-
-    /// Replace the whole table; a half-typed byte is dropped.
     fn fill(&mut self, table: [u8; SIZE]) {
         self.table = table;
         self.nibble = None;
     }
-
     fn as_text(&self) -> String {
         let mut out = String::new();
         for row in self.table.chunks(16) {
@@ -84,90 +88,213 @@ impl Slave {
         }
         out
     }
+    fn range(&self) -> Result<(u16, u16), String> {
+        let offset = parse_hex(&self.offset, 255, "表偏移")? as u16;
+        let len = parse_num(&self.len, 1, 256, "片段长度")? as u16;
+        if u32::from(offset) + u32::from(len) > 256 {
+            return Err("PC 表片段不能越过 256 B 边界，不会回绕".into());
+        }
+        Ok((offset, len))
+    }
+    fn write_request(&self, port: u8) -> Result<ControlRequest, String> {
+        let (offset, len) = self.range()?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or("先从设备读回本片段，取得同步 generation")?;
+        let end = usize::from(offset) + usize::from(len);
+        if offset < snapshot.offset || end > usize::from(snapshot.offset) + snapshot.data.len() {
+            return Err("下发片段须在最近一次读回或提交的范围内；先读取所选片段".into());
+        }
+        Ok(ControlRequest::TableWrite {
+            port,
+            offset,
+            data: self.table[usize::from(offset)..end].to_vec(),
+            expected: Some(snapshot.generation),
+        })
+    }
+    fn readback(&mut self, snapshot: &TableSnapshot) {
+        let start = usize::from(snapshot.offset);
+        let end = start + snapshot.data.len();
+        if end > SIZE {
+            return;
+        }
+        self.table[start..end].copy_from_slice(&snapshot.data);
+        self.base[start..end].copy_from_slice(&snapshot.data);
+        self.snapshot = Some(snapshot.clone());
+        self.nibble = None;
+    }
 }
 
-pub fn show(ui: &mut egui::Ui, s: &mut Slave) {
-    widgets::work_columns(ui, s, 264.0, 820.0, config, |ui, s| {
-        summary(ui, s);
-        ui.add_space(12.0);
-        table(ui, s);
-    });
-}
-
-fn summary(ui: &mut egui::Ui, s: &Slave) {
-    let addr = parse_addr(&s.addr).map_or("—".to_owned(), |a| format!("0x{a:02x}"));
-    let nonzero = s.table.iter().filter(|b| **b != 0).count();
-    widgets::summary_strip(
-        ui,
-        &[
-            ("从机地址", addr),
-            ("已改", format!("{} B", s.edited())),
-            ("非零", format!("{nonzero} B")),
-            ("光标", format!("0x{:02X}", s.cursor)),
-        ],
-        "本窗口编辑",
-    );
-}
-
-fn config(ui: &mut egui::Ui, s: &mut Slave) {
-    let t = theme::of(ui);
-    widgets::panel(
-        ui,
-        "从机配置",
-        |ui| {
-            widgets::badge(ui, "I2C0", Tone::Neutral);
-        },
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            widgets::field_row(ui, "端口", false, |ui| {
-                widgets::fixed_value(ui, "I2C0", FIXED_PORT);
-            });
-            widgets::field_row(ui, "从机地址", false, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.addr)
-                        .hint_text("0x50")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(ui.available_width()),
-                );
-            });
-            widgets::field_row(ui, "寄存器表", false, |ui| {
-                ui.label(egui::RichText::new("256 B · 1 字节偏移").size(12.0));
-            });
-            widgets::field_row(ui, "访问方式", true, |ui| {
-                ui.label(egui::RichText::new("EEPROM 式，同 24C02").size(12.0));
-            });
-            if let Err(e) = parse_addr(&s.addr) {
-                if !s.addr.trim().is_empty() {
-                    ui.label(egui::RichText::new(e).size(11.5).color(t.red));
+impl Slave {
+    pub(super) fn disconnected(&mut self) {
+        for editor in &mut self.editors {
+            editor.snapshot = None;
+            editor.nibble = None;
+        }
+    }
+    pub(super) fn on_control(
+        &mut self,
+        request: &ControlRequest,
+        result: &Result<ControlReply, DeviceError>,
+    ) {
+        let Some(editor) = self.editors.get_mut(usize::from(request.port())) else {
+            return;
+        };
+        match (request, result) {
+            (_, Err(error))
+                if error.session_invalidated
+                    || matches!(
+                        error.status,
+                        Some(ControlStatus::Conflict | ControlStatus::WrongRole)
+                    ) =>
+            {
+                editor.snapshot = None
+            }
+            (ControlRequest::TableRead { .. }, Ok(ControlReply::Table(snapshot))) => {
+                editor.readback(snapshot)
+            }
+            (
+                ControlRequest::TableWrite { offset, data, .. },
+                Ok(ControlReply::Committed(commit)),
+            ) => {
+                let end = usize::from(*offset) + data.len();
+                if end <= SIZE {
+                    editor.base[usize::from(*offset)..end].copy_from_slice(data);
+                    editor.snapshot = Some(TableSnapshot {
+                        offset: *offset,
+                        data: data.clone(),
+                        generation: commit.generation,
+                    });
                 }
             }
+            _ => {}
+        }
+    }
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    slave: &mut Slave,
+    port: u8,
+    caps: &ControlCapabilities,
+    state: Option<&PortState>,
+    cx: Ctx,
+) -> Option<ControlRequest> {
+    let editor = &mut slave.editors[usize::from(port)];
+    let mut action = None;
+    widgets::work_columns(
+        ui,
+        editor,
+        264.0,
+        820.0,
+        |ui, editor| {
+            action = config(ui, editor, port, caps, state, cx);
+        },
+        |ui, editor| {
+            let address = state.map_or("未确认".into(), |s| {
+                format!("0x{:02X}", s.config.slave_address)
+            });
+            widgets::summary_strip(
+                ui,
+                &[
+                    ("端口", format!("CH{port}")),
+                    ("实际地址", address),
+                    ("草稿差异", format!("{} B", editor.edited())),
+                ],
+                "本地草稿；仅显式下发才写设备",
+            );
+            ui.add_space(12.0);
+            ui.add_enabled_ui(!cx.busy, |ui| table(ui, editor));
         },
     );
-    ui.add_space(8.0);
-    widgets::note(
-        ui,
-        "主机写入的第 1 个字节是偏移，之后逐字节写入；读取从当前偏移开始，到表尾回到 0。",
-    );
-    ui.add_space(10.0);
+    action
+}
+
+fn config(
+    ui: &mut egui::Ui,
+    editor: &mut Editor,
+    port: u8,
+    caps: &ControlCapabilities,
+    state: Option<&PortState>,
+    cx: Ctx,
+) -> Option<ControlRequest> {
+    let mut action = None;
+    let slave_role = state.is_some_and(|s| s.config.role == PortRole::Slave);
     widgets::panel(
         ui,
-        "与设备同步",
-        |_| {},
+        "从机表同步",
         |ui| {
-            ui.horizontal(|ui| {
-                widgets::action_button(ui, false, "下发到设备").on_disabled_hover_text(NO_CMD);
-                widgets::action_button(ui, false, "从设备读回").on_disabled_hover_text(NO_CMD);
+            widgets::badge(ui, &format!("CH{port}"), Tone::Neutral);
+        },
+        |ui| {
+            widgets::note(ui,"角色、地址和超时在上方配置。此处编辑的是设备从机表，与主机页访问的外部 EEPROM 分开。");
+            if !slave_role {
+                widgets::note(ui, "先把所选端口配置为从机并读回确认，才能访问设备表。");
+            }
+            if !caps.supports_table {
+                widgets::note(ui, "当前设备不支持 PC 从机表访问。");
+            }
+            ui.add_enabled_ui(!cx.busy, |ui| {
+                widgets::field_row(ui, "片段偏移", false, |ui| {
+                    widgets::unit_edit(ui, &mut editor.offset, "0x00", "");
+                });
+                widgets::field_row(ui, "片段长度", false, |ui| {
+                    widgets::unit_edit(ui, &mut editor.len, "256", "B");
+                });
             });
-            ui.label(
-                egui::RichText::new("表格保存在本窗口，关闭后不保留。")
-                    .size(11.5)
-                    .color(t.muted),
+            match &editor.snapshot {
+                Some(snapshot) => {
+                    ui.label(format!(
+                        "已确认快照：0x{:02X} 起 {} B，generation {}",
+                        snapshot.offset,
+                        snapshot.data.len(),
+                        snapshot.generation
+                    ));
+                }
+                None => widgets::note(ui, "尚无可用设备快照；草稿数值不代表设备内容。"),
+            }
+            let range = editor.range();
+            if let Err(error) = &range {
+                widgets::error(ui, error);
+            }
+            let write = editor.write_request(port);
+            ui.horizontal_wrapped(|ui| {
+                let on = cx.connected && !cx.busy && slave_role && caps.supports_table;
+                if widgets::action_button(ui, on && range.is_ok(), "从设备读回片段").clicked()
+                {
+                    let (offset, len) = range.as_ref().copied().unwrap();
+                    action = Some(ControlRequest::TableRead { port, offset, len });
+                }
+                if widgets::ink_button(
+                    ui,
+                    on && caps.supports_table_cas && write.is_ok(),
+                    "下发片段 (CAS)",
+                )
+                .clicked()
+                {
+                    action = write.clone().ok();
+                }
+            });
+            if let Err(error) = &write {
+                widgets::muted(ui, error);
+            }
+            widgets::note(
+                ui,
+                "读回会替换所选草稿片段。CAS 冲突后保留草稿，需要重新读回；不会自动覆盖或重发。",
             );
         },
     );
+    ui.add_space(8.0);
+    widgets::note(ui,"外部 I2C 的第 1 个写入字节是偏移，随后字节写表并在 0xFF 回绕。PC 片段不回绕，也不改变外部 I2C 当前偏移。");
+    widgets::note(
+        ui,
+        "PC 读回是一个提交点的快照；外部连续读可能跨 PC 提交，不承诺整笔单一版本。",
+    );
+    action
 }
 
-fn table(ui: &mut egui::Ui, s: &mut Slave) {
+fn table(ui: &mut egui::Ui, s: &mut Editor) {
     let t = theme::of(ui);
     let edited = s.edited();
     widgets::panel(
@@ -208,7 +335,7 @@ fn table(ui: &mut egui::Ui, s: &mut Slave) {
     );
 }
 
-fn grid(ui: &mut egui::Ui, s: &mut Slave) {
+fn grid(ui: &mut egui::Ui, s: &mut Editor) {
     let t = theme::of(ui);
     let avail = ui.available_width();
     let ascii = avail >= 600.0;
@@ -353,7 +480,7 @@ fn grid(ui: &mut egui::Ui, s: &mut Slave) {
 }
 
 /// Hex digits type into the cursor cell; arrows move; Esc drops a half byte.
-fn keys(ui: &mut egui::Ui, id: egui::Id, s: &mut Slave) {
+fn keys(ui: &mut egui::Ui, id: egui::Id, s: &mut Editor) {
     ui.memory_mut(|m| {
         m.set_focus_lock_filter(
             id,
@@ -388,7 +515,7 @@ fn keys(ui: &mut egui::Ui, id: egui::Id, s: &mut Slave) {
     }
 }
 
-fn inspector(ui: &mut egui::Ui, s: &mut Slave) {
+fn inspector(ui: &mut egui::Ui, s: &mut Editor) {
     let t = theme::of(ui);
     let i = s.cursor;
     let v = s.table[i];
@@ -471,7 +598,7 @@ mod tests {
 
     #[test]
     fn typing_two_digits_writes_and_advances() {
-        let mut s = Slave::default();
+        let mut s = Editor::default();
         s.type_digit(0x3);
         assert_eq!(s.table[0], 0);
         s.type_digit(0xc);
@@ -489,10 +616,105 @@ mod tests {
 
     #[test]
     fn fill_drops_half_typed_byte() {
-        let mut s = Slave::default();
+        let mut s = Editor::default();
         s.type_digit(0xa);
         s.fill([0xff; SIZE]);
         s.type_digit(0x1);
         assert_eq!((s.table[0], s.nibble), (0xff, Some(0x1)));
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use usb_i2c::control::TableCommit;
+
+    #[test]
+    fn port_snapshots_drafts_and_generation_are_independent() {
+        let mut slave = Slave::default();
+        assert!(slave.editors[0].write_request(0).is_err());
+        let snapshot = TableSnapshot {
+            offset: 0,
+            data: vec![0x11; 256],
+            generation: u64::from(u32::MAX) + 5,
+        };
+        slave.on_control(
+            &ControlRequest::TableRead {
+                port: 0,
+                offset: 0,
+                len: 256,
+            },
+            &Ok(ControlReply::Table(snapshot.clone())),
+        );
+        assert_eq!(slave.editors[0].table, [0x11; 256]);
+        assert_eq!(slave.editors[1].table, [0; 256]);
+        slave.editors[0].offset = "0xFF".into();
+        slave.editors[0].len = "1".into();
+        slave.editors[0].table[255] = 0x99;
+        let request = slave.editors[0].write_request(0).unwrap();
+        match &request {
+            ControlRequest::TableWrite {
+                port,
+                offset,
+                data,
+                expected,
+            } => {
+                assert_eq!(
+                    (*port, *offset, data.as_slice(), *expected),
+                    (0, 255, &[0x99][..], Some(snapshot.generation))
+                );
+            }
+            _ => panic!(),
+        }
+        slave.on_control(
+            &request,
+            &Ok(ControlReply::Committed(TableCommit {
+                offset: 255,
+                len: 1,
+                generation: snapshot.generation + 1,
+            })),
+        );
+        assert_eq!(slave.editors[0].base[255], 0x99);
+        assert_eq!(
+            slave.editors[0].snapshot.as_ref().unwrap().generation,
+            snapshot.generation + 1
+        );
+        assert!(slave.editors[1].snapshot.is_none());
+        slave.disconnected();
+        assert!(slave.editors[0].snapshot.is_none());
+        assert_eq!(slave.editors[0].table[255], 0x99);
+        assert!(slave.editors[0].write_request(0).is_err());
+    }
+
+    #[test]
+    fn conflict_retains_draft_without_replay_and_partial_snapshot_bounds_writes() {
+        let mut slave = Slave::default();
+        let snapshot = TableSnapshot {
+            offset: 254,
+            data: vec![1, 2],
+            generation: 8,
+        };
+        slave.editors[0].readback(&snapshot);
+        slave.editors[0].offset = "0xFE".into();
+        slave.editors[0].len = "2".into();
+        slave.editors[0].table[254] = 9;
+        let request = slave.editors[0].write_request(0).unwrap();
+        let error = DeviceError {
+            message: "CAS conflict".into(),
+            session_invalidated: false,
+            result_unknown: false,
+            status: Some(ControlStatus::Conflict),
+            hpm_stat: Some(0),
+        };
+        slave.on_control(&request, &Err(error));
+        assert_eq!(slave.editors[0].table[254], 9);
+        assert!(slave.editors[0].snapshot.is_none());
+        assert!(slave.editors[0].write_request(0).is_err());
+        slave.editors[0].readback(&snapshot);
+        for (offset, len) in [("0xFF", "2"), ("0x00", "256"), ("0x100", "1")] {
+            slave.editors[0].offset = offset.into();
+            slave.editors[0].len = len.into();
+            assert!(slave.editors[0].write_request(0).is_err());
+        }
     }
 }
