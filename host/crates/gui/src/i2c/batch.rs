@@ -118,15 +118,19 @@ impl Batch {
                 ui.add_enabled_ui(!cx.busy, |ui| {
                     ui.push_id(port, |ui| {
                         ui.horizontal(|ui| {
-                            widgets::pick(
-                                ui,
-                                &mut d.op,
-                                &[
-                                    (Op::Write, "写入"),
-                                    (Op::Read, "读取"),
-                                    (Op::WriteRead, "写后读"),
-                                ],
-                            );
+                            // pick fills its available width; reserve one field
+                            // so address and speed remain inside this same row.
+                            ui.allocate_ui(egui::vec2(120.0, 26.0), |ui| {
+                                widgets::pick(
+                                    ui,
+                                    &mut d.op,
+                                    &[
+                                        (Op::Write, "写入"),
+                                        (Op::Read, "读取"),
+                                        (Op::WriteRead, "写后读"),
+                                    ],
+                                );
+                            });
                             ui.label("地址");
                             ui.add(egui::TextEdit::singleline(&mut d.addr).desired_width(65.0));
                             ui.label("SCL");
@@ -198,6 +202,105 @@ impl Batch {
 mod tests {
     use super::*;
     use usb_i2c::device::Device;
+
+    fn edit_text_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) if matches!(text.galley.text(), "0x50" | "100000") => {
+                out.push((
+                    text.galley.text().into(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    edit_text_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn batch_controls_stay_inside_page_width() {
+        for dark in [false, true] {
+            for width in [900.0, 1200.0, 1600.0] {
+                for op in [Op::Write, Op::Read, Op::WriteRead] {
+                    let ctx = egui::Context::default();
+                    crate::theme::install(&ctx);
+                    crate::fonts::install(&ctx);
+                    ctx.set_theme(if dark {
+                        egui::Theme::Dark
+                    } else {
+                        egui::Theme::Light
+                    });
+                    let mut batch = Batch::default();
+                    batch.set_connection(Device::offline().capabilities(), true);
+                    for draft in &mut batch.drafts {
+                        draft.op = op;
+                    }
+                    let mut page_rect = egui::Rect::NOTHING;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::Panel::left("batch_test_nav")
+                                .exact_size(crate::nav::WIDTH)
+                                .show(ui, |_| {});
+                            egui::CentralPanel::default()
+                                .frame(
+                                    egui::Frame::new()
+                                        .inner_margin(egui::Margin::symmetric(20, 16)),
+                                )
+                                .show(ui, |ui| {
+                                    widgets::page_width(ui, |ui| {
+                                        page_rect = ui.max_rect();
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                batch.show(
+                                                    ui,
+                                                    Ctx {
+                                                        connected: true,
+                                                        busy: false,
+                                                        now: std::time::Duration::ZERO,
+                                                    },
+                                                );
+                                                assert!(
+                                                    ui.min_rect().right()
+                                                        <= page_rect.right() + 0.5,
+                                                    "batch overflow at width={width}, dark={dark}: {:?} beyond {:?}",
+                                                    ui.min_rect(),
+                                                    page_rect,
+                                                );
+                                            });
+                                    });
+                                });
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let mut fields = Vec::new();
+                    for shape in &output.shapes {
+                        edit_text_rects(&shape.shape, &mut fields);
+                    }
+                    for value in ["0x50", "100000"] {
+                        let matching: Vec<_> = fields
+                            .iter()
+                            .filter(|(text, _)| text == value)
+                            .collect();
+                        assert_eq!(matching.len(), 2, "both ports must show {value}");
+                        for (_, rect) in matching {
+                            assert!(page_rect.contains_rect(*rect), "{value}: {rect:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn legacy_batch_is_blocked_and_offline_requests_keep_independent_fields() {
