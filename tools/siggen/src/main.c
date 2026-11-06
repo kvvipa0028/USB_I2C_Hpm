@@ -1,107 +1,71 @@
-/*
- * siggen: I2C master test peer on an HPMicro EVK. Board-agnostic: build
- * with -DBOARD=hpm6750evkmini (or any board defining BOARD_APP_I2C_BASE).
- *
- * USB CDC command line (line based, `OK ...` / `ERR <reason>`):
- *   start   - begin issuing one transaction round every 100 ms on
- *             BOARD_APP_I2C_BASE: write {0xDE,0xAD,0x00} to 0x50, then
- *             read 2 bytes from 0x50
- *   stop    - stop the rounds
- *   status  - print running state and round count
- *
- * With no slave attached the address byte is NACKed.
- */
-
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
 #include "board.h"
-#include "hpm_i2c_drv.h"
 #include "usb_config.h"
 #include "cdc_acm.h"
+#include "siggen_board.h"
+#include "siggen_session.h"
 
-#define SIG_I2C        BOARD_APP_I2C_BASE
-#define SIG_ADDR       0x50U
-#define SIG_PERIOD_MS  100U
-
-static const uint8_t sig_wr[3] = { 0xDE, 0xAD, 0x00 };
-
-static volatile bool g_running;
-static volatile uint32_t g_rounds;
-
-static char g_line[96];
-static uint16_t g_linelen;
-
-static void cmd_help(void)
-{
-    cdc_write("commands: start | stop | status\n", 32);
-}
-
-static void handle_line(const char *cmd)
-{
-    if (!strcmp(cmd, "start")) {
-        g_running = true;
-        cdc_write("OK start\n", 9);
-    } else if (!strcmp(cmd, "stop")) {
-        g_running = false;
-        cdc_write("OK stop\n", 8);
-    } else if (!strcmp(cmd, "status")) {
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "OK running=%d rounds=%lu\n",
-                         g_running ? 1 : 0, (unsigned long)g_rounds);
-        cdc_write(buf, (uint32_t)n);
-    } else if (!strcmp(cmd, "help")) {
-        cmd_help();
-    } else {
-        cdc_write("ERR unknown command\n", 21);
-    }
-}
-
-static void poll_cdc_line(void)
-{
-    int c;
-    while ((c = cdc_getchar()) >= 0) {
-        if (c == '\r' || c == '\n') {
-            if (g_linelen > 0) {
-                g_line[g_linelen] = '\0';
-                handle_line(g_line);
-                g_linelen = 0;
-            }
-        } else if (g_linelen < sizeof(g_line) - 1) {
-            g_line[g_linelen++] = (char)c;
-        }
-    }
-}
-
-static void issue_round(void)
-{
-    uint8_t rd[2];
-    /* with no slave on the bus these calls return NACK errors */
-    (void)i2c_master_write(SIG_I2C, SIG_ADDR, sig_wr, sizeof(sig_wr));
-    (void)i2c_master_read(SIG_I2C, SIG_ADDR, rd, sizeof(rd));
-    g_rounds++;
-}
+/* JTAG-visible software observations, not measured electrical timing. */
+siggen_peer_t g_siggen;
+static siggen_line_assembler_t line;
+static siggen_reply_t reply;
+static char response[SIGGEN_RESPONSE_CAP];
 
 int main(void)
 {
-    uint32_t tick = 0;
-
     board_init();
+    siggen_board_init(&g_siggen);
+    siggen_peer_init(&g_siggen, siggen_board_hal());
+    siggen_line_assembler_init(&line);
     board_init_usb((USB_Type *)CONFIG_HPM_USBD_BASE);
     intc_set_irq_priority(CONFIG_HPM_USBD_IRQn, 2);
     cdc_acm_init(0, CONFIG_HPM_USBD_BASE);
-
-    board_init_i2c(SIG_I2C);
-
-    while (1) {
-        poll_cdc_line();
-        if (g_running) {
-            tick++;
-            if (tick >= SIG_PERIOD_MS) {
-                tick = 0;
-                issue_round();
+    for (;;) {
+        /* Deadlines keep advancing even when the host stops reading CDC IN. */
+        uint32_t irq = siggen_board_lock();
+        if (cdc_take_session_lost()) {
+            siggen_peer_stop(&g_siggen);
+            siggen_line_assembler_init(&line);
+        }
+        siggen_peer_poll(&g_siggen, siggen_board_now_us());
+        siggen_board_unlock(irq);
+        /* Bound parsing work between hardware deadline polls. */
+        for (unsigned i = 0; i < 64 && cdc_can_write(); ++i) {
+            int byte = cdc_getchar();
+            if (byte == -1) break;
+            siggen_command_t command;
+            const char *error;
+            enum siggen_session_event event = siggen_session_parse(&line, byte, &command, &error);
+            irq = siggen_board_lock();
+            /* A loss observed after dequeuing a byte also cancels its command. */
+            if (cdc_take_session_lost()) {
+                siggen_peer_stop(&g_siggen);
+                siggen_line_assembler_init(&line);
+                event = SIG_SESSION_NONE;
+                error = NULL;
+            } else {
+                if (event == SIG_SESSION_STOP || event == SIG_SESSION_STOP_ERROR)
+                    siggen_peer_stop(&g_siggen);
+                if (event == SIG_SESSION_COMMAND)
+                    siggen_peer_prepare(&g_siggen, &command, siggen_board_now_us(), &reply);
+            }
+            siggen_board_unlock(irq);
+            if (event == SIG_SESSION_COMMAND) siggen_peer_format(&reply, response, sizeof(response));
+            else if (error != NULL) (void)snprintf(response, sizeof(response), "%s", error);
+            if (event == SIG_SESSION_COMMAND || error != NULL) {
+                if (strncmp(response, "OK running=", 11) == 0) {
+                    uint32_t rx_overflows, tx_rejected;
+                    cdc_stats(&rx_overflows, &tx_rejected);
+                    size_t used = strlen(response) - 1U;
+                    (void)snprintf(response + used, sizeof(response) - used,
+                        " usb_rx_overflows=%" PRIu32 " usb_tx_rejected=%" PRIu32 "\n",
+                        rx_overflows, tx_rejected);
+                }
+                (void)cdc_write(response, (uint32_t)strlen(response));
             }
         }
-        board_delay_ms(1);
+        /* No delay_ms, SDK blocking I2C call or CDC endpoint busy-wait. */
     }
-    return 0;
 }
