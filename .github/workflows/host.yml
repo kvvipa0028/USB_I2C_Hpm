@@ -9,6 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  firmware-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure firmware native regression
+        run: cmake -S firmware/tests -B build/firmware-native -G Ninja
+      - name: Build strict C checks with sanitizers
+        run: cmake --build build/firmware-native
+      - name: Test protocol and portable firmware logic
+        run: ctest --test-dir build/firmware-native --output-on-failure
   host:
     strategy:
       fail-fast: false
