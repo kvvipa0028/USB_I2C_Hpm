@@ -19,7 +19,7 @@ jobs:
       run:
         working-directory: host
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable Rust
         run: rustup update stable --no-self-update
       - name: Install Clippy
