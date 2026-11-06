@@ -11,7 +11,7 @@
 
 1. **现成实现两侧都有，不需要从零写 ISO-TP。** HPM 官方没有：本机 `hpm_sdk` v1.13.0 中没有 ISO-TP / UDS 代码；`hpm_apps` 的 OTA 方案只支持 UART / USB / ENET 通道。所以只能集成第三方库。
 2. **固件侧首选 `SimonCahill/isotp-c`**（MIT，C99，不用堆、不依赖 OS，支持经典 CAN 和 CAN FD 64 字节）。移植时实现 3 个钩子即可，CAN 收发用 HPM SDK 的 `hpm_can_drv`（HPM6360 的 CAN IP 是 `CAN_Type`，不是 MCAN）。如果以后固件里还要跑 UDS 客户端（例如脱机刷写），可用 `driftregion/iso14229`，它内嵌的就是这个 isotp-c。
-3. **上位机侧首选 `automotive` crate**（MIT，Rust，自带 ISO-TP + UDSClient，支持 CAN FD）。它的 `CanAdapter` trait 是公开的，可以为本设备写一个适配器。代价是要引入 tokio，而且版本还是 0.x。
+3. **上位机侧首选 `automotive` crate**（MIT，Rust，自带 ISO-TP + UDSClient，支持 CAN FD）。它的 `CanAdapter` trait 是公开的，可以为本设备写一个适配器。代价是要引入 tokio，而且版本还是 0.x。**最终未采用（2026-11-05）：** ISO-TP 放在固件侧（见第 5 条），UDS 会话层也决定自己用 Rust 写（[端到端计划 2.1 节](uds-flash-implementation-plan.md)第 2 条）。
 4. **不建议采用：** `ecu_diagnostics`（GPL-3.0-only，与本仓库 MIT 许可及商业分发冲突）；基于 Linux 内核 ISO-TP 的封装（只能在 Linux 上用）；Zephyr ISO-TP（需要 Zephyr RTOS，本仓库固件是裸 HPM SDK）。
 5. 传输层放在哪一侧，需要按第 5 节的权衡决定。这个选择对应方案文档里尚未确认的 D04 / D05。**已决定（2026-11-05）：放在固件侧**，计划见 [uds-isotp-firmware-plan.md](uds-isotp-firmware-plan.md)。
 
@@ -76,7 +76,7 @@ HPM 侧现状（本机核实）：
 
 ## 6. 本次未覆盖或未核实
 
-- ISO 15765-2 的时序参数：已按用户提供的 ISO 15765-2:2011（第 2 版，只涵盖经典 CAN）核对（2026-11-05）。N_As/N_Ar/N_Bs/N_Cr 超时为 1000 ms，是下限，实际不晚于 +50%（表 16、8.7.1）。逐条落实见 [固件计划 4.4 节](uds-isotp-firmware-plan.md)。2016 / 2024 版正文仍未看到。
+- ISO 15765-2 的时序参数：已按用户提供的 ISO 15765-2:2011（第 2 版，只涵盖经典 CAN）核对（2026-11-05）。N_As/N_Ar/N_Bs/N_Cr 超时为 1000 ms，是下限，实际不晚于 +50%（表 16、8.7.1）。逐条落实见 [固件计划 4.4 节](uds-isotp-firmware-plan.md)。目标 ECU 的 `0x7E3` / `0x7EB` 落在 OBD 法规 ID 范围内，按 ISO 14229-3:2012 第 11.1 节，网络层时序可能要按 ISO 15765-4 取值；15765-4 原文未拿到，具体数值待定（同见 4.4 节）。2016 / 2024 版正文仍未看到。
 - 没有核实 `automotive` ISO-TP 源码的实际行为，也没有读 `ecu_diagnostics` 的 README（两次请求都超时）。
 - 各库都没有在 HPM6360 或本仓库 host 上编译，也没有做与真实 ECU 的互通测试。
 - 商业实现（Vector、ETAS 等 AUTOSAR CanTp）和 SAE J2534 规范原文都没有调研。

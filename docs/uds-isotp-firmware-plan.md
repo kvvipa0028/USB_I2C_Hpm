@@ -17,6 +17,7 @@
 | 原始帧记录 | 首期就做：固件保存带时间戳的收发帧，上位机读取 |
 | 测试对端 | Vector VN1630A + 真实 ECU（含 Bootloader） |
 | 目标 ECU 已知参数 | 请求 ID `0x7E3`，响应 ID `0x7EB`，填充 `0xAA`。从 ID 数值推断是 11 位标准帧、正常寻址（不带扩展地址字节），**待 ECU 资料确认**。其余信息后续提供 |
+| 传输层设计取舍 | PDU 上限 4095 B、延迟回复且新请求可中止、USB 断开时停止主动发送但 CAN 保持在线、接收默认全部接收且可选只收诊断 ID。逐条确认记录见[端到端计划 2.1 节](uds-flash-implementation-plan.md)第 8–11 条，具体规则见 4.2、4.3 节 |
 
 ## 2. 范围
 
@@ -61,16 +62,16 @@
 | `usb_i2c/src/can_port.c` | CAN1 开关和波特率；RX 中断把帧写入软件环（建议 256 帧，溢出计数）；STB 非阻塞发送；错误计数和总线关闭（bus-off）状态 |
 | `usb_i2c/src/isotp_glue.c` | 一条物理链路；实现 isotp-c 的三个钩子（发送、µs 时钟用 MCHTMR、调试输出）；发送钩子根据链路上下文决定 11/29 位 ID、FD/BRS，经典帧按配置填充到 8 字节；接收完成后把 PDU 放入 RX 队列（深度 2，满了丢弃并计数） |
 | `usb_i2c/src/trace.c` | 变长记录环（64 KiB）：`ts_us u32, id u32(bit31=29位, bit30=FD, bit29=BRS), dir u8, len u8, data[len]`，按 4 字节对齐；满了丢弃新记录并计数 |
-| `usb_i2c/src/usb_i2c.c` | 新命令解析、延迟回复状态机；USB 复位或断开时中止传输并关闭 CAN |
+| `usb_i2c/src/usb_i2c.c` | 新命令解析、延迟回复状态机；USB 复位、断开或挂起时，按 4.3 的规则中止传输、停止主动发送 |
 
 主循环每轮依次做：处理 USB 请求 → 从 RX 软件环取帧（全部写入 trace；与 `rx_id` 匹配的帧交给 `isotp_on_can_message`）→ `isotp_poll` → 把完成的 PDU 放入队列 → 检查延迟命令是否已经完成或超时。
 
 ### 4.2 设计约束
 
-- **接收不丢帧，时序可能被拖慢。** I2C 命令会阻塞主循环（100 kHz 下 256 字节约二十几 ms）。这期间 RX 中断继续收帧，但 FC 的发出会被推迟。ECU 一侧 N_Bs 默认是 1 s，所以能接受。进行中的 ISO-TP 命令不会和 I2C 同时执行（见 4.3 的中止规则）。
+- **接收不丢帧，时序可能被拖慢。** I2C 命令会阻塞主循环（100 kHz 下 256 字节约二十几 ms）。这期间 RX 中断继续收帧，但 FC 的发出会被推迟。按 ISO 15765-2，ECU 一侧的 N_Bs 是 1 s，问题不大。但目标 ECU 用的是 OBD 法规 ID，可能要按 ISO 15765-4 计时（见 4.4 节最后一行），那时 N_Bs 会短得多，余量随之变小。进行中的 ISO-TP 命令不会和 I2C 同时执行（见 4.3 的中止规则）；刷写期间设备由任务独占，也不会有 I2C 插进来。
 - **STmin 精度取决于主循环轮询频率。** F1 和 F3 实测；如果不够，再把 `isotp_poll` 改到定时器中断里驱动。
 - **TX 记录的时间戳不是上总线时间。** 它记的是帧交给 STB 的时刻，用于排查；判断时序以分析仪采集为准。
-- **验收滤波首期全部接收**，这样 trace 才完整。在繁忙总线上要看溢出计数，必要时再改。
+- **验收滤波有两种模式**，由 `CAN_OPEN` 的标志位选择：“全部接收”（默认，trace 完整，能看到总线上的其他节点）和“只收诊断 ID”（硬件只放行 `rx_id`，trace 只有诊断帧和本机发出的帧）。实车总线负载高时，全部接收可能让 64 KiB 的 trace 缓冲溢出；ISO-TP 不受影响，但 `trace_drop` 会增加，上位机据此提示切换模式。
 
 ### 4.3 USB 协议 v2
 
@@ -80,10 +81,10 @@
 | --- | --- | --- | --- | --- |
 | 0x01 | PING | — | 版本 `2` + `"usb_i2c 0.2"` | 立即 |
 | 0x10 | I2C | 不变 | 不变 | 立即 |
-| 0x20 | CAN_OPEN | `nominal_bps u32, data_bps u32(0=经典), flags u8(bit0 FD)` | — | 立即；清空 RX 环、RX 队列、trace |
+| 0x20 | CAN_OPEN | `nominal_bps u32, data_bps u32(0=经典), flags u8(bit0 FD, bit1 只收诊断 ID)` | — | 立即；清空 RX 环、RX 队列、trace。设了 bit1 时，验收滤波按随后 `ISOTP_CONFIG` 的 `rx_id` 设置；改配置时一并更新 |
 | 0x21 | CAN_CLOSE | — | — | 立即；中止 ISO-TP |
 | 0x22 | CAN_STATUS | — | `state u8(0关/1主动/2被动/3 bus-off), tec u8, rec u8, rsvd u8, rx_ring_drop u32, rxq_drop u32, trace_drop u32, last_err u32` | 立即 |
-| 0x30 | ISOTP_CONFIG | `tx_id u32, rx_id u32, func_id u32(0xFFFFFFFF=无), flags u8(bit0 29位, bit1 FD, bit2 BRS, bit3 填充), pad u8, tx_dl u8, bs u8, stmin u8(FC 原值), rsvd u8, n_bs_ms u16, n_cr_ms u16` | — | 立即；重置链路并清空 RX 队列；有传输进行中时返回 BUSY；以下情况返回 BAD_REQ：`stmin` 为保留值（0x80–0xF0、0xFA–0xFF）、`n_bs_ms` / `n_cr_ms` 不在 1000–1500 之间（见 4.4），或 vendored 版本不支持该取值 |
+| 0x30 | ISOTP_CONFIG | `tx_id u32, rx_id u32, func_id u32(0xFFFFFFFF=无), flags u8(bit0 29位, bit1 FD, bit2 BRS, bit3 填充), pad u8, tx_dl u8, bs u8, stmin u8(FC 原值), rsvd u8, n_as_ms u16, n_bs_ms u16, n_cr_ms u16` | — | 立即；重置链路并清空 RX 队列；有传输进行中时返回 BUSY；以下情况返回 BAD_REQ：`stmin` 为保留值（0x80–0xF0、0xFA–0xFF）、任一超时不在 10–1500 ms 之间，或 vendored 版本不支持该取值。超时默认 1000 ms（ISO 15765-2），由上位机按目标适用的标准填写（见 4.4） |
 | 0x31 | ISOTP_SEND | `p0 bit0=功能寻址`；`timeout_ms u32` + PDU（1–4095 B） | `ts_us u32`（最后一帧发送完成的时刻） | **延迟**：发送完成、失败或 `timeout_ms` 到期 |
 | 0x32 | ISOTP_RECV | `timeout_ms u32` | `ts_us u32`（最后一帧收到的时刻）+ PDU | **延迟**：队列中有 PDU 就立即回复，否则等到超时 |
 | 0x40 | TRACE_READ | — | `dropped u32` + 若干条完整记录（取出即删除） | 立即 |
@@ -98,7 +99,7 @@
 - **SEND 被中止或超时**时，如果最后一帧已经发送完成，就报告成功；否则报告 `ABORTED` / `TIMEOUT`，ECU 会因为 N_Cr 超时丢弃这个不完整的 PDU。只有在 USB 层失败时，结果才算“未知”。
 - **功能寻址**用 `isotp_send_with_id(func_id)`，只允许单帧；超长时返回 BAD_REQ。物理链路正在多帧发送时返回 BUSY。
 - **PDU 上限是 4095 B**，覆盖经典 CAN 12 位 FF_DL 的全部范围。上位机要把 TransferData 的块长限制在 min(ECU 的 maxNumberOfBlockLength, 4095) 以内。CAN FD 大于 4095 的长度等 FD 验收时再定。
-- **USB 复位或断开时**：中止 ISO-TP，关闭 CAN，清空队列。设备不会自己重新打开总线。
+- **USB 复位、断开或挂起时**：中止进行中的 ISO-TP 传输，清空 RX 队列，停止一切主动发送（包括 FC），但 CAN 控制器保持在线：继续回 ACK，继续把收到的帧写进 trace 缓冲，直到上位机重新发 `CAN_OPEN` 或 `CAN_CLOSE`。这样在只有 ECU 和本设备两个节点的台架上，ECU 的帧仍有人应答，不会因为没有 ACK 而不停重发。设备自己不会主动发出任何帧。上位机程序崩溃但 USB 没有复位时，固件察觉不到；待处理的命令按自己的超时结束，下一个新请求也会中止它（见上一条）。
 
 ### 4.4 ISO 15765-2:2011 条款落实
 
@@ -114,11 +115,12 @@
 | 8.5.5.6 | 收到保留的 STmin 值时，本次传输按 127 ms 发送 | F0 核实 isotp-c | F3 注入 0x80、0xFA |
 | 8.3 | 客户端作为接收方时，同一报文的各个 FC 必须用相同的 BS/STmin；作为发送方时，必须按每个 FC 的值调整 | 传输进行中禁止修改配置；发送时每收到一个 FC 都重新读取 BS/STmin | F3：对端在同一报文内改变 BS/STmin |
 | 8.6 / 8.7.4 | N_WFTmax 只约束接收方；发送方每收到一个 WAIT 就重启 N_Bs，没有次数上限 | 本机作为接收方不发 WAIT（N_WFTmax = 0）。F0 核实 isotp-c 作为发送方时是否设了 WAIT 次数上限（`ISO_TP_MAX_WFT_NUMBER`）；如果有，设为不限制或修改代码，并记录 | F3：对端连发 10 个 WAIT 再发 CTS，应成功；对端一直发 WAIT，应由 `timeout_ms` 结束 |
-| 8.7.1 表 16 | N_As、N_Ar、N_Bs、N_Cr 的超时都是 1000 ms。超时值是下限，实际超时不得晚于 +50%（≤ 1500 ms）。性能要求：(N_Br + N_Ar) 和 (N_Cs + N_As) 都要小于对应超时的 0.9 倍 | `n_bs_ms`、`n_cr_ms` 只接受 1000–1500；I2C 阻塞约二十几 ms，远小于 900 ms | F3：对端不回 FC、或中途停发 CF，测到的超时落在 1000–1500 ms |
-| 8.7.2（N_As） | 一帧在 1000 ms 内没有发出去（例如总线上没有节点回 ACK），中止并报 N_TIMEOUT_A | 胶层跟踪每帧是否发送完成；超时就撤销 STB 中的帧并上报 | F3：断开对端，制造无 ACK |
+| 8.7.1 表 16 | N_As、N_Ar、N_Bs、N_Cr 的超时都是 1000 ms。超时值是下限，实际超时不得晚于 +50%（≤ 1500 ms）。性能要求：(N_Br + N_Ar) 和 (N_Cs + N_As) 都要小于对应超时的 0.9 倍 | 超时可配置，默认 1000 ms；固件保证实际超时不早于配置值、不晚于配置值的 1.5 倍。I2C 阻塞约二十几 ms，远小于 900 ms | F3：对端不回 FC、或中途停发 CF，测到的超时落在配置值的 100%–150% |
+| 8.7.2（N_As / N_Ar） | 一帧（包括本机作为接收方发出的 FC）在超时内没有发出去（例如总线上没有节点回 ACK），中止并报 N_TIMEOUT_A | 胶层跟踪每帧是否发送完成；超时就撤销 STB 中的帧并上报 | F3：断开对端，制造无 ACK，发送和接收两个方向各测一次 |
 | 8.7.3 表 18 | 全双工下：接收进行中又收到同一地址的 SF/FF，以 N_UNEXP_PDU 结束当前接收，并把新帧当作新报文处理；空闲时收到的 CF、不在发送中时收到的 FC，都忽略 | F0 核实 isotp-c 的行为 | F3 注入 |
-| 9.4.2.1 / 9.4.3 | 采用填充方案时，DLC 恒为 8，包括 SF、FC 和最后一个 CF；采用填充方案的接收方会忽略 DLC < 8 的帧 | ECU 用 `0xAA` 填充，所以本机发的每一帧都必须是 DLC 8（F3 通过条件之一）；本机收到 DLC 小于 N_PCI 所需长度的帧时忽略 | F3 |
+| 9.4.2.1 / 9.4.3 | 采用填充方案时，DLC 恒为 8，包括 SF、FC 和最后一个 CF；采用填充方案的接收方会忽略 DLC < 8 的帧 | ECU 用 `0xAA` 填充，所以本机发的每一帧都必须是 DLC 8（F3 通过条件之一）。接收规则按本机配置选：开启填充时，DLC < 8 的帧一律忽略；关闭填充时，只忽略 DLC 小于 N_PCI 所需长度的帧 | F3：对端发 DLC 不足的 SF、FF、CF、FC |
 | 附录 B | 11 位 ID 中 0x7F4–0x7F6、0x7FA–0x7FB 由 ISO 保留 | 配置这些 ID 时给出警告 | — |
+| ISO 14229-3:2012 第 11.1 节 | 把 OBD 法规用的 11 位 ID 用于增强诊断时：(a) 网络层时序按 ISO 15765-4；(b) DLC 必须为 8，未用字节填充 | 目标 ECU 的 `0x7E3` / `0x7EB` 落在 OBD 法规 ID 范围内（这个范围由 ISO 15765-4 定义，原文未拿到），所以超时可能要按 15765-4 取值，比 15765-2 的 1000 ms 短得多。具体数值以 15765-4 原文或 ECU 规范为准，在 F0 时确定后写进清单的 `transport`；(b) 与已有的填充要求一致。TP 层测试用例表把 ECU 的 N_Cr 当作 150 ms（端到端计划 2.2 节），因此本机发送多帧时，“上一 CF 发送完成 → 下一 CF 发出”必须稳定小于 135 ms（150 ms 的 0.9 倍）。收到保留 STmin 时按 127 ms 发送，仍在这个范围内，但余量只有 8 ms | F3 / F4 按确定的数值测超时窗口；F3 对端按 N_Cr = 150 ms 配置，所有用例都不能触发对端的 N_Cr 超时 |
 
 ### 4.5 上位机（`host/crates/usb-i2c`）
 
@@ -136,11 +138,11 @@
 
 | 阶段 | 工作 | 通过条件 |
 | --- | --- | --- |
-| F0 准备 | 已有：VN1630A，ECU 的 `0x7E3` / `0x7EB` / `0xAA`。还需要：一台装好 Vector 驱动、XL Driver Library 和 Vector Hardware Config 的 Windows 电脑（CANoe / CANalyzer 可选）；VN1630A 用哪个通道及 D-SUB 接线；台架两端各有一个 120 Ω 终端（EVK 和 VN1630A 是否内置终端都未核实）。ECU 待补：确认 11 位和正常寻址、功能寻址 ID、可安全读取的 DID 列表、P2/P2*、参考工具记录。vendor isotp-c 并核实运行时可配项（BS、STmin、超时、FD 填充值），再按 4.4 节逐条核实标准行为：STmin 计时起点、收到保留 STmin 时的处理、发送方是否有 WAIT 次数上限、非法 SF_DL/FF_DL、DLC 不足的帧、意外 PDU、N_As 超时；与标准不符的地方修改 vendored 代码或在胶层补上，并记录差异 | 进入 F3 前，Windows 对端环境和接线要到位；进入 F4 前，ECU 资料要齐全；如果 isotp-c 只能在编译期设置 BS/STmin/超时，首期固定为 BS=0、STmin=0、1000 ms，配置命令拒绝其他值，并写进本文 |
+| F0 准备 | 已有：VN1630A，ECU 的 `0x7E3` / `0x7EB` / `0xAA`；会有一台 Windows 电脑（已确认）。还需要：在这台电脑上装好 Vector 驱动、XL Driver Library 和 Vector Hardware Config（CANoe / CANalyzer 可选）；确定网络层超时取值（ISO 15765-2 还是 15765-4，见 4.4 节最后一行）；VN1630A 用哪个通道及 D-SUB 接线；台架两端各有一个 120 Ω 终端（EVK 和 VN1630A 是否内置终端都未核实）。ECU 待补：确认 11 位和正常寻址、功能寻址 ID、可安全读取的 DID 列表、P2/P2*、参考工具记录。vendor isotp-c 并核实运行时可配项（BS、STmin、超时、FD 填充值），再按 4.4 节逐条核实标准行为：STmin 计时起点、收到保留 STmin 时的处理、发送方是否有 WAIT 次数上限、非法 SF_DL/FF_DL、DLC 不足的帧、意外 PDU、N_As 超时；与标准不符的地方修改 vendored 代码或在胶层补上，并记录差异 | 进入 F3 前，Windows 对端环境和接线要到位；进入 F4 前，ECU 资料要齐全；如果 isotp-c 只能在编译期设置 BS/STmin/超时，首期固定为 BS=0、STmin=0、1000 ms，配置命令拒绝其他值，并写进本文 |
 | F1 片内自测 `firmware/isotp_proto` | 沿用 i2c_proto 的做法，独立固件，结果放在 `g_result` 里通过 JTAG 读取；复用 `usb_i2c/src` 的 `can_port.c` 和 `isotp_glue.c`。CAN1 内部回环，在同一控制器上建两条链路（`0x7E3` ↔ `0x7EB`，填充 `0xAA`，与目标 ECU 一致）对发。矩阵：长度 {1,7,8,62,63,4095} × 两个方向 × BS {0,1,8} × STmin {0, 0xF5, 1 ms}（SN 回绕在 4095 B 时自然覆盖）；FD 的 TX_DL 64 顺带跑一遍。另做外部冒烟：向分析仪发 10 帧、从分析仪收 10 帧 | magic 正确，0 处不一致，0 个协议错误，并记录耗时。**假设待验证**：内部回环会把本机发出的帧送进 RB，SDK 回环示例就是这样做的。如果不成立，F1 改为与分析仪对测 |
 | F2 协议 v2 集成 | 4.3–4.5 的固件和上位机改动 | `cargo test --workspace --all-targets --locked`、`cargo clippy ... -D warnings`、Windows 目标 `cargo check` 全部通过；固件 release 构建通过。上板：PING 返回版本 2；按 README 已有检查做 I2C 回归（PING、写、重复 START 读、缺席地址 NACK）；`isotp recv --timeout 30000` 期间杀掉 CLI，重新运行 `ping` 能在 2 s 内成功 |
-| F3 与分析仪互通（经典 CAN 500k） | 对端：Windows 上运行 `tools/isotp_peer`（python-can 的 vector 后端 + python-can-isotp，通过 VN1630A 模拟 ECU：在 `0x7E3` 上接收、从 `0x7EB` 发出、填充 `0xAA`），STmin 依据 VN1630A 的硬件时间戳判断。建议设备的 CLI 也在同一台 Windows 上运行，这样一个脚本就能编排每个用例；前提是先补做 README 中“待上板”的 WinUSB 检查。如果 WinUSB 不通，就由 macOS 运行 CLI、Windows 运行对端，逐个用例手工配合。用例：长度 1/6/7/8/62/63/64/4095 双向，4096 在本地被拒；对端 FC 的 BS 取 0/1/8，STmin 取 0、0xF1、0xF5、1、10、127 ms，以及保留值 0x80、0xFA；同一报文内对端改变 BS/STmin；对端连发 10 个 FC.WAIT 后发 CTS、对端一直发 WAIT；对端不回 FC；FC 报溢出；FS 为保留值；对端中途停发 CF；序号错误；接收中途对端插入新的 SF/FF；空闲时收到孤立的 CF/FC；对端发 SF_DL = 0 或 FF_DL = 7 的帧、DLC 不足的帧；断开对端（无 ACK，触发 N_As）；填充开/关和不同填充值；29 位 ID；功能寻址单帧；本机作为接收方时宣告的 BS/STmin；SEND 进行中发 PING 中止 | 本机发出的所有帧（包括 FC 和最后一个 CF）DLC 都是 8，填充字节都是 `0xAA`；数据逐字节一致；按分析仪时间戳，“上一 CF 发送完成 → 下一 CF 开始”都不小于 STmin，收到保留值时不小于 127 ms；N_Bs、N_Cr、N_As 超时落在 1000–1500 ms；每种故障都返回 4.4 节对应的 N_Result（意外 PDU、非法帧按标准忽略或重新开始），且下一个 PDU 能正常收发；同一次 4095 B 交换中，trace 与分析仪采集的帧数、顺序、ID、数据一致，dropped = 0；记录 4095 B 的发送耗时（不设目标值） |
-| F4 真实 ECU 只读互通 | 按 ECU 资料配置（`tx 0x7E3`、`rx 0x7EB`、填充 `0xAA`，其余参数待补）；执行 `3E 00`、`10 01/03`，用 `22` 读单个 DID（长 DID 会触发多帧响应），用 `22` 一次读多个 DID 产生多帧请求；VN1630A 同时采集（用哪个工具在 F0 确定） | 响应与 ECU 规范或参考工具记录一致；没有 ISO-TP 错误；trace 与采集一致。ECU 不支持多 DID 时会回 NRC，但这仍能证明多帧发送已完成。**不做**任何擦除、写入或复位 |
+| F3 与分析仪互通（经典 CAN 500k） | 对端：Windows 上运行 `tools/isotp_peer`（python-can 的 vector 后端 + python-can-isotp，通过 VN1630A 模拟 ECU：在 `0x7E3` 上接收、从 `0x7EB` 发出、填充 `0xAA`），STmin 依据 VN1630A 的硬件时间戳判断。建议设备的 CLI 也在同一台 Windows 上运行，这样一个脚本就能编排每个用例；前提是先补做 README 中“待上板”的 WinUSB 检查。如果 WinUSB 不通，就由 macOS 运行 CLI、Windows 运行对端，逐个用例手工配合。用例：长度 1/6/7/8/62/63/64/4095 双向，4096 在本地被拒；对端 FC 的 BS 取 0/1/8，STmin 取 0、0xF1、0xF5、1、10、127 ms，以及保留值 0x80、0xFA；同一报文内对端改变 BS/STmin；对端连发 10 个 FC.WAIT 后发 CTS、对端一直发 WAIT；对端不回 FC；FC 报溢出；FS 为保留值；对端中途停发 CF；序号错误；接收中途对端插入新的 SF/FF；空闲时收到孤立的 CF/FC；对端发 SF_DL = 0 或 FF_DL = 7 的帧、DLC 不足的帧；断开对端（无 ACK，触发 N_As）；填充开/关和不同填充值；29 位 ID；功能寻址单帧；本机作为接收方时宣告的 BS/STmin；SEND 进行中发 PING 中止。以下用例对照用户提供的 TP 层测试用例表（TP1–TP41 及补充项），把其中“测 ECU”的用例反过来测本机：STmin 再加 20、30、40、50、60 ms，BS 再加 20（TP11、TP25）；对端回两个 FC，第二个应被忽略（TP8）；FC 的 DLC 不足、或从其他 ID 发来的 FC，应被忽略，随后 N_Bs 超时（TP29、TP30）；本机发送多帧期间对端插入 SF、FF、CF 或未知帧（N_PCItype > 3），本机的发送不受影响，SF/FF 按全双工当作新报文接收（TP15–TP19、TP35）；FF_DL = 0、DLC 不足的 CF/FF（TP33、TP34、TP40）；对端重复发送同一个 CF、丢掉第 3 个 CF，应报 N_WRONG_SN（TP3、TP4）；对端先发 WAIT 再发 CTS（TP28、TP_NewAdd_SendWT） | 本机发出的所有帧（包括 FC 和最后一个 CF）DLC 都是 8，填充字节都是 `0xAA`；数据逐字节一致；按分析仪时间戳，“上一 CF 发送完成 → 下一 CF 开始”都不小于 STmin，收到保留值时不小于 127 ms；N_Bs、N_Cr、N_As 超时落在配置值的 100%–150%；每种故障都返回 4.4 节对应的 N_Result（意外 PDU、非法帧按标准忽略或重新开始），且下一个 PDU 能正常收发；同一次 4095 B 交换中，trace 与分析仪采集的帧数、顺序、ID、数据一致，dropped = 0；记录 4095 B 的发送耗时（不设目标值） |
+| F4 真实 ECU 只读互通 | 按 ECU 资料配置（`tx 0x7E3`、`rx 0x7EB`、填充 `0xAA`，P2/P2* 和流控参数见端到端计划 2.2 节）；执行 `3E 00`、`10 01/03`（核对响应 `50 xx 00 32 00 C8`），`22 F1 90`（VIN，20 字节响应，触发多帧接收，本机以 STmin/BS 配置回 FC），在 ECU 处于 Boot 时再读 `22 F1 98`（19 字节响应）；多帧请求用一次读多个 DID 产生；VN1630A 同时采集（用哪个工具在 F0 确定） | 响应与 ECU 规范或参考工具记录一致；没有 ISO-TP 错误；trace 与采集一致。ECU 不支持多 DID 时会回 NRC，但这仍能证明多帧发送已完成。**不做**任何擦除、写入或复位 |
 | F5（首期之后） | VN1630A 的内置通道已支持 CAN FD，硬件不缺；按 F3 矩阵跑 CAN FD 500k/2M、TX_DL 64，并确定 FD 下的填充值 | 在此之前，FD 一律标为未验证 |
 
 完成 F4 后，再进入方案文档的 P2：上位机 UDS 会话层和流程执行器。真实刷写所需的 ECU 资料见方案文档 D01。
@@ -149,12 +151,13 @@
 
 | 风险 / 待确认 | 处理 |
 | --- | --- |
-| VN1630A 的驱动和 python-can vector 后端只支持 Windows | F3 的对端必须在 Windows 上运行；是否有可用的 Windows 电脑待确认 |
+| VN1630A 的驱动和 python-can vector 后端只支持 Windows | F3 的对端必须在 Windows 上运行；已确认会有一台 Windows 电脑 |
+| 目标 ECU 的 ID 在 OBD 法规范围内，网络层时序可能要按 ISO 15765-4（ISO 14229-3:2012 第 11.1 节），但 15765-4 原文没拿到 | F0 时取得原文或 ECU 规范中的数值；拿到之前，超时用 15765-2 的 1000 ms，F3 / F4 不判定超时是否符合规范 |
 | 本设备的 WinUSB 在全新 Windows 上尚未验收（README 待上板） | F3 前先补做；不通时退回“两台电脑、逐个用例手工配合” |
 | isotp-c 的运行时配置能力（BS、STmin、超时、FD 填充值）未逐项核实 | F0 vendor 时核实；不支持的取值由协议拒绝，不悄悄改值 |
 | isotp-c 某些行为可能与 ISO 15765-2:2011 不一致（STmin 计时起点、发送方的 WAIT 上限等） | F0 按 4.4 节逐条核对；不一致的地方改代码或在胶层补上，并记录 |
 | 主循环轮询下的 STmin 精度 | F1 / F3 实测；不满足时改为定时器驱动 |
-| 全部接收的滤波设置在繁忙总线上可能溢出 | CAN_STATUS 暴露计数；出现溢出后再加硬件滤波 |
+| 默认的“全部接收”在繁忙总线上可能让 trace 溢出 | CAN_STATUS 暴露 `trace_drop`；出现丢弃时，上位机提示改用“只收诊断 ID”（`CAN_OPEN` bit1，4.2 节） |
 | EVK 和 VN1630A 是否自带终端电阻 | F0 查原理图和 VN1600 手册，或用万用表在 CANH–CANL 间实测（总线断电时应约 60 Ω） |
 | ECU 的寻址方式、功能寻址 ID、DID、P2 尚缺 | 不影响 F0–F3；F4 前补齐 |
 | PRD 把 CAN 列为 V2，需要新硬件 | 本计划只在 EVK 上做原型；产品硬件和产品字符串（仍叫 `usb_i2c`）留待产品决定，本文不改规划文档 |
