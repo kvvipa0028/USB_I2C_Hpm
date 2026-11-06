@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::bridge::Bridge;
+use crate::bridge::{BatchRejectedBeforeExecution, Bridge};
 use crate::proto::{
     Capabilities, Status, TransferOutcome, TransferRequest, BATCH_MAX_XFER, EXTENSION_VERSION,
     MAX_XFER,
@@ -43,6 +43,16 @@ impl fmt::Display for DeviceError {
 }
 
 impl std::error::Error for DeviceError {}
+
+impl DeviceError {
+    fn from_usb(error: anyhow::Error, session_invalidated: bool, has_write: bool) -> Self {
+        Self {
+            result_unknown: has_write && !error.is::<BatchRejectedBeforeExecution>(),
+            message: error.to_string(),
+            session_invalidated,
+        }
+    }
+}
 
 enum Backend {
     Usb(Bridge),
@@ -121,10 +131,8 @@ impl Device {
             .validate_transfer(request)
             .map_err(Self::invalid_request)?;
         match &mut self.backend {
-            Backend::Usb(bridge) => bridge.i2c_port(request).map_err(|error| DeviceError {
-                message: error.to_string(),
-                session_invalidated: !bridge.is_usable(),
-                result_unknown: !request.wdata.is_empty(),
+            Backend::Usb(bridge) => bridge.i2c_port(request).map_err(|error| {
+                DeviceError::from_usb(error, !bridge.is_usable(), !request.wdata.is_empty())
             }),
             Backend::Offline(model) => {
                 let result = model.transfer(request);
@@ -154,10 +162,12 @@ impl Device {
             .validate_batch(requests)
             .map_err(Self::invalid_request)?;
         match &mut self.backend {
-            Backend::Usb(bridge) => bridge.batch(requests).map_err(|error| DeviceError {
-                message: error.to_string(),
-                session_invalidated: !bridge.is_usable(),
-                result_unknown: requests.iter().any(|r| !r.wdata.is_empty()),
+            Backend::Usb(bridge) => bridge.batch(requests).map_err(|error| {
+                DeviceError::from_usb(
+                    error,
+                    !bridge.is_usable(),
+                    requests.iter().any(|r| !r.wdata.is_empty()),
+                )
             }),
             // Sequential model evaluation is intentional: it is not a timing
             // simulation or evidence of concurrent execution on hardware.
@@ -231,6 +241,27 @@ impl Offline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_batch_rejection_has_known_outcome_but_usb_write_failure_does_not() {
+        let rejected = DeviceError::from_usb(BatchRejectedBeforeExecution.into(), false, true);
+        assert!(!rejected.result_unknown);
+        assert!(!rejected.session_invalidated);
+        assert!(rejected.message.contains("before execution"));
+
+        let timeout = DeviceError::from_usb(
+            std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
+            true,
+            true,
+        );
+        assert!(timeout.result_unknown);
+        assert!(timeout.session_invalidated);
+
+        // Preserve conservative handling of confirmed I2C write failures.
+        let nack = DeviceError::from_usb(anyhow::anyhow!("I2C Nack"), false, true);
+        assert!(nack.result_unknown);
+        assert!(!nack.session_invalidated);
+    }
 
     fn request(port: u8, wdata: &[u8], rlen: usize) -> TransferRequest {
         TransferRequest {

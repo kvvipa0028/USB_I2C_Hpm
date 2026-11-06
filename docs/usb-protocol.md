@@ -85,7 +85,7 @@ count u8=2, reserved u8=0
 
 ## 5. USB 边界、恢复与验证
 
-旧请求与单端口扩展请求遇到 USB packet size 的整数倍时，host 在负载之后补 1 个零字节，以 short packet 结束；固件忽略 wlen 以外的这个传输填充，不把它当 I2C 写数据。所有本轮帧都必须保持小于 512 B。回复的接收容量向 endpoint MPS 向上取整。
+所有请求（含旧命令、`I2C_PORT` 和 `I2C_BATCH`）在 `8 + wlen` 为 USB endpoint MPS 的整数倍时，host 在负载之后追加且只追加 1 个零字节，以 short packet 结束；其它长度不添加填充。`wlen` 只计算命令负载，不包含该字节；固件按 `wlen` 解析并忽略此唯一传输填充，不把它当 I2C 写数据或 batch 项。所有本轮帧都必须保持小于 512 B。回复的接收容量向 endpoint MPS 向上取整。
 
 保持原有有界 PING 同步和单 session 规则；能力查询在同步之后执行。同步丢弃阶段的 IN 容量为 512 B，以覆盖旧单笔和新批次最大回复；不在数据中搜寻貌似 PING 的片段。固件仍须保持有界的单请求/单回复槽，不能私自增加无界完成队列。任何协议/USB失败均清理并作废会话，不自动重试 I2C。写事务失败时可能已经产生部分或完整副作用，USB 取消和重新连接都不能撤销；固件 Timeout 与 host USB Timeout 分别记录。
 
@@ -97,4 +97,4 @@ GUI/CLI 共用 `Device` API；只有显式调用 `Device::offline()` 才进入�
 
 模型允许 10kHz–1MHz 速率参数，但只验证范围，不计算线时序。批次先校验两项再依次更新两个独立模型，保留逐端口成功/NACK 结果；它不是并发时间仿真。进程退出/重建后表清零，不提供持久化或设备从机表同步能力。
 
-`DeviceError` 的 session_invalidated 表示会话是否已作废，result_unknown 保守标注已提交 USB 写失败的结果未知。offline NACK 和本地拒绝不会伪造 USB 失联或结果未知；新请求在已失效会话上被本地拒绝，也不代表它又执行了一次。以上模型测试只证明 host 功能与契约，不关闭任何需上板的 P0 验收。
+`DeviceError` 的 session_invalidated 表示会话是否已作废，result_unknown 保守标注已提交 USB 写失败的结果未知。第 4 节定义的执行前全批次拒绝具有明确未执行结果，因此这两个标志均为 false。offline NACK 和本地拒绝不会伪造 USB 失联或结果未知；新请求在已失效会话上被本地拒绝，也不代表它又执行了一次。以上模型测试只证明 host 功能与契约，不关闭任何需上板的 P0 验收。

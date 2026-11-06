@@ -49,6 +49,18 @@ pub struct Bridge {
     capabilities: Option<Capabilities>,
 }
 
+/// The exact whole-batch rejection proves neither port was executed.
+#[derive(Debug)]
+pub(crate) struct BatchRejectedBeforeExecution;
+
+impl std::fmt::Display for BatchRejectedBeforeExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("batch rejected by firmware before execution")
+    }
+}
+
+impl std::error::Error for BatchRejectedBeforeExecution {}
+
 impl Bridge {
     /// Open a connection and synchronize it using only harmless PING commands.
     /// This never retries an earlier I2C operation or determines its outcome.
@@ -340,7 +352,7 @@ impl<T: Transport> Session<T> {
         let encoded = proto::encode_batch(seq, requests).map_err(|e| anyhow!(e))?;
         let reply = self.transact(CMD_I2C_BATCH, encoded, proto::batch_reply_max(requests))?;
         if reply.status == Status::BadRequest && reply.hpm_stat == 0 && reply.data.is_empty() {
-            bail!("batch rejected by firmware before execution");
+            return Err(BatchRejectedBeforeExecution.into());
         }
         proto::decode_batch(&reply, requests).map_err(|e| self.fail(CMD_I2C_BATCH, anyhow!(e)))
     }

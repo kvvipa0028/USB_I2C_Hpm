@@ -462,6 +462,22 @@ fn batch_reply(seq: u8, first: &[u8], second: &[u8], second_status: u8) -> Vec<u
 }
 
 #[test]
+fn whole_batch_rejection_preserves_session_and_carries_execution_certainty() {
+    let (mut bridge, state) = session();
+    state.borrow_mut().omit_replies = true;
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_I2C_BATCH, 1, 3, &[]));
+    let error = bridge.batch(&batch_requests(0, 0)).unwrap_err();
+    assert!(error.is::<BatchRejectedBeforeExecution>());
+    assert!(bridge.is_usable());
+    assert_eq!(state.borrow().requests.len(), 1);
+    assert_eq!(state.borrow().cancellation_count, 0);
+    assert_clean(&state);
+}
+
+#[test]
 fn batch_partial_failure_is_a_confirmed_result_without_replay() {
     let (mut bridge, state) = session();
     state.borrow_mut().omit_replies = true;

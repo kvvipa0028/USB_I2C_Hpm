@@ -238,7 +238,7 @@ host 测试可独立完成；真实功能与 Windows 窗口必须在设备上验
 
 必须上板：先未锁定 EVK 功能验证，最终 EVT 的实际 NOR/供电再做同样中断测试。
 
-为何提前设计：本机 SDK [flash_xip.ld](/Users/zhaojianzhi/hpm/hpm_sdk/soc/HPM6300/HPM6360/toolchains/gcc/flash_xip.ld:23) 的 app 偏移为 0x3000，而 [flash_dfu.ld](/Users/zhaojianzhi/hpm/hpm_sdk/soc/HPM6300/HPM6360/toolchains/gcc/flash_dfu.ld:10) 默认预留 0x20000。SDK [DFU 跳转](/Users/zhaojianzhi/hpm/hpm_sdk/samples/cherryusb/device/dfu/common/hpm_dfu_trigger.c:79)只检查 magic，不能当产品密码学签名验证。
+为何提前设计：本机 SDK `$HPM_SDK_BASE/soc/HPM6300/HPM6360/toolchains/gcc/flash_xip.ld`（flash_xip.ld，行 23） 的 app 偏移为 0x3000，而 `$HPM_SDK_BASE/soc/HPM6300/HPM6360/toolchains/gcc/flash_dfu.ld`（flash_dfu.ld，行 10） 默认预留 0x20000。SDK `$HPM_SDK_BASE/samples/cherryusb/device/dfu/common/hpm_dfu_trigger.c`（DFU 跳转，行 79）只检查 magic，不能当产品密码学签名验证。
 
 **S9：安全启动、加密和防克隆**
 
