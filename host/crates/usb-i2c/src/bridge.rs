@@ -6,8 +6,9 @@ use anyhow::{anyhow, bail, Context};
 use nusb::MaybeFuture;
 
 use crate::proto::{
-    self, Capabilities, Reply, Status, TransferRequest, CAPABILITIES_DATA_LEN, CMD_CAPABILITIES,
-    CMD_I2C, CMD_I2C_PORT, CMD_PING, HDR, MAX_XFER, PING_DATA_MAX,
+    self, Capabilities, Reply, Status, TransferOutcome, TransferRequest, CAPABILITIES_DATA_LEN,
+    CMD_CAPABILITIES, CMD_I2C, CMD_I2C_BATCH, CMD_I2C_PORT, CMD_PING, HDR, MAX_FRAME,
+    PING_DATA_MAX,
 };
 
 mod transport;
@@ -128,6 +129,15 @@ impl Bridge {
             self.session.i2c(request.addr, &request.wdata, request.rlen)
         }
     }
+
+    /// Submit one bounded batch; never emulate hardware concurrency by issuing
+    /// two legacy commands when the device does not advertise batch support.
+    pub fn batch(&mut self, requests: &[TransferRequest]) -> anyhow::Result<Vec<TransferOutcome>> {
+        self.capabilities()?
+            .validate_batch(requests)
+            .map_err(|e| anyhow!(e))?;
+        self.session.batch(requests)
+    }
 }
 
 // The same request/session code runs against nusb and the focused queue model
@@ -165,7 +175,7 @@ impl<T: Transport> Session<T> {
             // Drop endpoints even if cancellation has not finished. nusb owns
             // their buffers until completion; never wait indefinitely here.
         }
-        let uncertainty = if matches!(cmd, CMD_I2C | CMD_I2C_PORT) {
+        let uncertainty = if matches!(cmd, CMD_I2C | CMD_I2C_PORT | CMD_I2C_BATCH) {
             "; I2C operation may have executed and was not retried; USB cancellation cannot undo it"
         } else {
             ""
@@ -213,7 +223,7 @@ impl<T: Transport> Session<T> {
         // Discard both together rather than guessing boundaries in I2C data.
         let seq = self.next_seq();
         let transport = self.transport()?;
-        transport.submit_in(HDR + MAX_XFER);
+        transport.submit_in(MAX_FRAME);
         let sent_len = transport.submit_out(proto::encode_ping(seq));
         wait_out(
             transport,
@@ -243,7 +253,7 @@ impl<T: Transport> Session<T> {
             let transport = self.transport()?;
             // Keep accepting full-sized completions while draining, but only
             // trust an entire correctly matched PING, never an embedded header.
-            transport.submit_in(HDR + MAX_XFER);
+            transport.submit_in(MAX_FRAME);
             let sent_len = transport.submit_out(proto::encode_ping(seq));
             wait_out(
                 transport,
@@ -268,7 +278,7 @@ impl<T: Transport> Session<T> {
                 }
                 // Discard only during connection setup, never retry an I2C
                 // request after an unexpected reply in an established session.
-                transport.submit_in(HDR + MAX_XFER);
+                transport.submit_in(MAX_FRAME);
             }
         }
         Ok(())
@@ -322,6 +332,17 @@ impl<T: Transport> Session<T> {
             ));
         }
         Ok(reply.data)
+    }
+
+    fn batch(&mut self, requests: &[TransferRequest]) -> anyhow::Result<Vec<TransferOutcome>> {
+        self.transport()?;
+        let seq = self.next_seq();
+        let encoded = proto::encode_batch(seq, requests).map_err(|e| anyhow!(e))?;
+        let reply = self.transact(CMD_I2C_BATCH, encoded, proto::batch_reply_max(requests))?;
+        if reply.status == Status::BadRequest && reply.hpm_stat == 0 && reply.data.is_empty() {
+            bail!("batch rejected by firmware before execution");
+        }
+        proto::decode_batch(&reply, requests).map_err(|e| self.fail(CMD_I2C_BATCH, anyhow!(e)))
     }
 
     fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {

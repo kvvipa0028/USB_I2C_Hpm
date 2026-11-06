@@ -7,12 +7,15 @@ pub const CMD_PING: u8 = 0x01;
 pub const CMD_CAPABILITIES: u8 = 0x02;
 pub const CMD_I2C: u8 = 0x10;
 pub const CMD_I2C_PORT: u8 = 0x11;
+pub const CMD_I2C_BATCH: u8 = 0x12;
 pub const HDR: usize = 8;
 pub const MAX_XFER: usize = 256;
 pub const CAPABILITIES_DATA_LEN: usize = 20;
 pub const EXTENSION_VERSION: u8 = 1;
 pub const MAX_PORTS: u8 = 2;
 pub const BATCH_MAX_XFER: usize = 240;
+/// Includes the largest extension response and a possible transport pad.
+pub const MAX_FRAME: usize = 512;
 /// Upper bound of the PING reply data (version byte + firmware id).
 pub const PING_DATA_MAX: usize = 64;
 
@@ -78,6 +81,25 @@ impl Capabilities {
         }
         Ok(())
     }
+
+    pub fn validate_batch(&self, requests: &[TransferRequest]) -> Result<(), String> {
+        if !self.supports_batch {
+            return Err("dual-port batches are unsupported".into());
+        }
+        validate_batch_shape(requests)?;
+        for request in requests {
+            self.validate_transfer(request)?;
+            if request.wdata.len() > self.batch_max_transfer
+                || request.rlen > self.batch_max_transfer
+            {
+                return Err(format!(
+                    "batch supports at most {} bytes per write and per read",
+                    self.batch_max_transfer
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +109,15 @@ pub struct TransferRequest {
     pub wdata: Vec<u8>,
     pub rlen: usize,
     pub speed_hz: u32,
+}
+
+/// A confirmed per-port result; an error on one port does not erase the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferOutcome {
+    pub port: u8,
+    pub status: Status,
+    pub hpm_stat: u32,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +253,102 @@ pub fn encode_i2c_port(seq: u8, request: &TransferRequest) -> Result<Vec<u8>, St
     v.extend_from_slice(&request.speed_hz.to_le_bytes());
     v.extend_from_slice(&request.wdata);
     Ok(v)
+}
+
+fn validate_batch_shape(requests: &[TransferRequest]) -> Result<(), String> {
+    if requests.len() != 2 || requests[0].port == requests[1].port {
+        return Err("a batch requires exactly one request for CH0 and one for CH1".into());
+    }
+    for request in requests {
+        validate_i2c(request.addr, &request.wdata, request.rlen)?;
+        if request.port >= MAX_PORTS || !(10_000..=1_000_000).contains(&request.speed_hz) {
+            return Err("invalid batch port or speed".into());
+        }
+        if request.wdata.len() > BATCH_MAX_XFER || request.rlen > BATCH_MAX_XFER {
+            return Err(format!(
+                "batch limit is {BATCH_MAX_XFER} bytes per write and per read"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 8-byte common header, 2-byte count/reserved, two 10-byte entries + writes.
+/// At 240 bytes per direction the OUT is <=510 and unpadded IN is <=506 bytes.
+pub fn encode_batch(seq: u8, requests: &[TransferRequest]) -> Result<Vec<u8>, String> {
+    validate_batch_shape(requests)?;
+    let wlen = 2 + 20 + requests.iter().map(|r| r.wdata.len()).sum::<usize>();
+    let rlen = 2 + 16 + requests.iter().map(|r| r.rlen).sum::<usize>();
+    let mut bytes = header(CMD_I2C_BATCH, seq, 0, wlen, rlen);
+    bytes.extend_from_slice(&[2, 0]);
+    for request in requests {
+        bytes.extend_from_slice(&[request.port, request.addr]);
+        bytes.extend_from_slice(&(request.wdata.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(request.rlen as u16).to_le_bytes());
+        bytes.extend_from_slice(&request.speed_hz.to_le_bytes());
+        bytes.extend_from_slice(&request.wdata);
+    }
+    Ok(bytes)
+}
+
+/// Call only after validating the batch. One extra byte is reserved for the
+/// deterministic reply pad that prevents a partial-error response ending at MPS.
+pub(crate) fn batch_reply_max(requests: &[TransferRequest]) -> usize {
+    HDR + 2 + 16 + requests.iter().map(|r| r.rlen).sum::<usize>() + 1
+}
+
+/// Validate the entire response before exposing even the first port's result.
+pub fn decode_batch(
+    reply: &Reply,
+    requests: &[TransferRequest],
+) -> Result<Vec<TransferOutcome>, String> {
+    validate_batch_shape(requests)?;
+    if reply.status != Status::Ok || reply.hpm_stat != 0 || reply.data.get(..2) != Some(&[2, 0]) {
+        return Err("invalid batch response header/count".into());
+    }
+    let mut cursor = 2;
+    let mut outcomes = Vec::with_capacity(2);
+    for request in requests {
+        let entry = reply
+            .data
+            .get(cursor..cursor + 8)
+            .ok_or("truncated batch result")?;
+        let port = entry[0];
+        let status = Status::from(entry[1]);
+        let length = u16::from_le_bytes([entry[2], entry[3]]) as usize;
+        let hpm_stat = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+        if port != request.port
+            || matches!(status, Status::Unknown(_))
+            || (status == Status::Ok && (length != request.rlen || hpm_stat != 0))
+            || (status != Status::Ok && length != 0)
+        {
+            return Err("invalid batch port/status/length".into());
+        }
+        cursor += 8;
+        let data = reply
+            .data
+            .get(cursor..cursor + length)
+            .ok_or("truncated batch data")?
+            .to_vec();
+        cursor += length;
+        outcomes.push(TransferOutcome {
+            port,
+            status,
+            hpm_stat,
+            data,
+        });
+    }
+    // Fixed 64-byte rule at both FS and HS: partial failure changes response
+    // length, so it cannot rely on filling the requested IN allocation exactly.
+    let expected_tail: &[u8] = if (HDR + cursor).is_multiple_of(64) {
+        &[0]
+    } else {
+        &[]
+    };
+    if reply.data.get(cursor..) != Some(expected_tail) {
+        return Err("invalid batch response trailing bytes or missing USB pad".into());
+    }
+    Ok(outcomes)
 }
 
 /// The device reads requests into a 512-byte buffer, so a request whose length is a
@@ -459,5 +586,124 @@ mod tests {
     #[test]
     fn nonzero_reply_reserved_byte_is_never_accepted() {
         assert!(decode(CMD_CAPABILITIES, 1, &[2, 1, 3, 1, 0, 0, 0, 0]).is_err());
+    }
+
+    fn batch_requests() -> [TransferRequest; 2] {
+        [
+            TransferRequest {
+                port: 0,
+                addr: 0x50,
+                wdata: vec![0x10, 0xaa],
+                rlen: 0,
+                speed_hz: 100_000,
+            },
+            TransferRequest {
+                port: 1,
+                addr: 0x50,
+                wdata: vec![0x20],
+                rlen: 2,
+                speed_hz: 400_000,
+            },
+        ]
+    }
+
+    #[test]
+    fn batch_golden_layout_and_fixed_two_port_contract() {
+        let requests = batch_requests();
+        assert_eq!(
+            encode_batch(9, &requests).unwrap(),
+            [
+                0x12, 9, 0, 0, 25, 0, 20, 0, 2, 0, 0, 0x50, 2, 0, 0, 0, 0xa0, 0x86, 1, 0, 0x10,
+                0xaa, 1, 0x50, 1, 0, 2, 0, 0x80, 0x1a, 6, 0, 0x20,
+            ]
+        );
+        assert!(encode_batch(0, &[]).is_err());
+        assert!(encode_batch(0, &requests[..1]).is_err());
+        assert!(encode_batch(0, &[requests[0].clone(), requests[0].clone()]).is_err());
+        let mut invalid = requests.clone();
+        invalid[1].wdata = vec![0; 241];
+        assert!(encode_batch(0, &invalid).is_err());
+        assert!(Capabilities::legacy().validate_batch(&requests).is_err());
+    }
+
+    #[test]
+    fn all_batch_lengths_fit_the_existing_usb_buffer_after_padding() {
+        for written in 0..=480 {
+            let mut requests = batch_requests();
+            requests[0].wdata = vec![0; written.min(240)];
+            requests[1].wdata = vec![0; written.saturating_sub(240)];
+            requests[0].rlen = 240;
+            requests[1].rlen = 240;
+            let frame = encode_batch(0, &requests).unwrap();
+            assert_eq!(frame.len(), 30 + written);
+            for mps in [64, 512] {
+                assert!(pad_for_mps(frame.clone(), mps).len() < MAX_FRAME);
+            }
+            assert_eq!(batch_reply_max(&requests), 507);
+        }
+    }
+
+    #[test]
+    fn batch_reply_requires_every_matching_port_and_its_exact_data_length() {
+        let requests = batch_requests();
+        let data = vec![
+            2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0x11, 0x22,
+        ];
+        let good = Reply {
+            status: Status::Ok,
+            hpm_stat: 0,
+            data: data.clone(),
+        };
+        let outcomes = decode_batch(&good, &requests).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[1].data, [0x11, 0x22]);
+        for (index, value) in [
+            (0, 1),
+            (0, 3),
+            (1, 1),
+            (2, 1),
+            (3, 99),
+            (6, 1),
+            (10, 0),
+            (11, 1),
+            (12, 1),
+        ] {
+            let mut bad = data.clone();
+            bad[index] = value;
+            assert!(
+                decode_batch(
+                    &Reply {
+                        status: Status::Ok,
+                        hpm_stat: 0,
+                        data: bad
+                    },
+                    &requests
+                )
+                .is_err(),
+                "index {index}"
+            );
+        }
+        for length in 0..data.len() {
+            assert!(decode_batch(
+                &Reply {
+                    status: Status::Ok,
+                    hpm_stat: 0,
+                    data: data[..length].to_vec()
+                },
+                &requests
+            )
+            .is_err());
+        }
+        let mut extra = data;
+        extra.push(0);
+        assert!(decode_batch(
+            &Reply {
+                status: Status::Ok,
+                hpm_stat: 0,
+                data: extra
+            },
+            &requests
+        )
+        .is_err());
     }
 }
