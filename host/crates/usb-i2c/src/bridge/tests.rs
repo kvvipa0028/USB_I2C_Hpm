@@ -1063,3 +1063,157 @@ fn unknown_or_malformed_status_is_not_a_normal_i2c_failure() {
         assert_invalidated(&mut bridge, &state);
     }
 }
+
+#[test]
+fn control_capabilities_fallback_is_exact_and_does_not_replace_base_capabilities() {
+    use crate::control::CMD_CONTROL_CAPS;
+    let (mut bridge, state) = session();
+    state.borrow_mut().omit_replies = true;
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_CAPABILITIES, 1, 3, &[]));
+    let base = bridge.capabilities().unwrap();
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_CONTROL_CAPS, 2, 3, &[]));
+    let control = bridge.control_capabilities(0).unwrap();
+    assert_eq!(base, Capabilities::legacy());
+    assert_eq!(control, crate::control::ControlCapabilities::unsupported(0));
+    assert!(bridge.is_usable());
+    assert_eq!(state.borrow().requests.len(), 2);
+    assert_clean(&state);
+
+    for response in [
+        reply(CMD_CONTROL_CAPS, 1, 3, &[0]),
+        reply(CMD_CONTROL_CAPS, 2, 3, &[]),
+        reply(CMD_CONTROL_CAPS, 1, 6, &[]),
+        reply(CMD_CONTROL_CAPS, 1, 0, &[0; 48]),
+        {
+            let mut r = reply(CMD_CONTROL_CAPS, 1, 3, &[]);
+            r[4] = 1;
+            r
+        },
+    ] {
+        let (mut bridge, state) = session();
+        state.borrow_mut().omit_replies = true;
+        state.borrow_mut().replies.push_back(response);
+        assert!(bridge.control_capabilities(0).is_err());
+        assert_eq!(state.borrow().requests.len(), 1);
+        assert_invalidated(&mut bridge, &state);
+    }
+}
+
+#[test]
+fn control_rejections_preserve_session_and_typed_diagnostics_without_retry() {
+    use crate::control::*;
+    for status in [3, 5, 6, 7, 8, 9] {
+        let (mut bridge, state) = session();
+        state.borrow_mut().omit_replies = true;
+        state
+            .borrow_mut()
+            .replies
+            .push_back(reply(CMD_CONFIG_PORT, 1, status, &[]));
+        let request = encode_config(1, 0, &PortConfig::default(), Some(0)).unwrap();
+        let error = bridge
+            .control_execute(CMD_CONFIG_PORT, request, 40, Duration::from_secs(2), |r| {
+                decode_port_state(r, 0)
+            })
+            .unwrap_err();
+        let diagnostic = error.downcast_ref::<ControlReplyError>().unwrap();
+        assert_eq!(diagnostic.status, ControlStatus::try_from(status).unwrap());
+        assert!(bridge.is_usable());
+        assert_eq!(state.borrow().requests.len(), 1);
+        assert_clean(&state);
+    }
+}
+
+#[test]
+fn control_write_usb_failure_and_malformed_reply_never_replay() {
+    use crate::control::*;
+    for bad in [
+        None,
+        Some(reply(CMD_TABLE_WRITE, 9, 0, &[0; 16])),
+        Some(reply(CMD_TABLE_WRITE, 1, 10, &[])),
+        Some(reply(CMD_TABLE_WRITE, 1, 7, &[0])),
+    ] {
+        let (mut bridge, state) = session();
+        state.borrow_mut().omit_replies = true;
+        if let Some(r) = bad {
+            state.borrow_mut().replies.push_back(r);
+        }
+        let request = encode_table_write(1, 0, 255, &[0xaa], Some(3)).unwrap();
+        let error = bridge
+            .control_execute(CMD_TABLE_WRITE, request, 16, Duration::from_secs(2), |r| {
+                decode_table_commit(r, 0, 255, 1)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("may have executed"));
+        assert_eq!(state.borrow().requests.len(), 1);
+        assert_invalidated(&mut bridge, &state);
+    }
+}
+
+#[test]
+fn control_table_snapshot_strips_only_required_full_speed_pad() {
+    use crate::control::*;
+    // 8-byte public header + 16-byte table metadata + 40 bytes is exactly 64.
+    let mut data = vec![0, 0, 0, 0, 40, 0, 0, 0];
+    data.extend_from_slice(&7u64.to_le_bytes());
+    data.extend_from_slice(&[0xab; 40]);
+    data.push(0);
+    let (mut bridge, state) = session();
+    state.borrow_mut().packet_size = 64;
+    state.borrow_mut().coalesce_full_packets = true;
+    state.borrow_mut().omit_replies = true;
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_TABLE_READ, 1, 0, &data));
+    let request = encode_table_read(1, 0, 0, 40).unwrap();
+    let snapshot = bridge
+        .control_execute(CMD_TABLE_READ, request, 56, Duration::from_secs(2), |r| {
+            decode_table_snapshot(r, 0, 0, 40)
+        })
+        .unwrap();
+    assert_eq!(snapshot.data, [0xab; 40]);
+    assert_eq!(snapshot.generation, 7);
+    assert_eq!(state.borrow().in_sizes, [65]);
+    assert_clean(&state);
+}
+
+#[test]
+fn advertised_transfer_and_control_waits_are_bounded_by_one_deadline() {
+    use crate::control::*;
+    let mut caps = ControlCapabilities::unsupported(0);
+    assert_eq!(control_transfer_timeout(&caps), Duration::from_secs(1));
+    caps.supports_timeouts = true;
+    caps.transaction_max_us = 2_000_000;
+    assert_eq!(control_transfer_timeout(&caps), Duration::from_millis(2500));
+    let (mut bridge, state) = session();
+    let request = TransferRequest {
+        port: 0,
+        addr: 0x50,
+        wdata: vec![1],
+        rlen: 0,
+        speed_hz: 100_000,
+    };
+    bridge
+        .i2c_port_timeout(&request, control_transfer_timeout(&caps))
+        .unwrap();
+    let s = state.borrow();
+    assert!(s.out_waits[0] > Duration::from_secs(2));
+    assert!(s.out_waits[0] <= Duration::from_millis(2500));
+    assert!(s.in_waits[0] <= s.out_waits[0]);
+}
+
+#[test]
+fn old_i2c_commands_reject_control_only_statuses() {
+    for status in 5..=9 {
+        let (mut bridge, state) = session();
+        state.borrow_mut().status = status;
+        assert!(bridge.i2c(0x50, &[1], 0).is_err());
+        assert_invalidated(&mut bridge, &state);
+    }
+}

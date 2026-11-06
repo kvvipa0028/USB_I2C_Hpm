@@ -2,5 +2,6 @@
 //! (VID:PID 1209:0001, product "usb_i2c", bulk OUT 0x01, bulk IN 0x81).
 
 pub mod bridge;
+pub mod control;
 pub mod device;
 pub mod proto;
