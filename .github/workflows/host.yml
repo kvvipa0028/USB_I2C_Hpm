@@ -19,6 +19,12 @@ jobs:
         run: cmake --build build/firmware-native
       - name: Test protocol and portable firmware logic
         run: ctest --test-dir build/firmware-native --output-on-failure
+      - name: Configure fault-injection peer native tests
+        run: cmake -S tools/siggen/tests -B build/siggen-native -G Ninja
+      - name: Build fault-injection peer checks with sanitizers
+        run: cmake --build build/siggen-native
+      - name: Test peer commands and fault state transitions
+        run: ctest --test-dir build/siggen-native --output-on-failure
   host:
     strategy:
       fail-fast: false

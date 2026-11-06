@@ -53,6 +53,23 @@ C 测试启用严格警告和 ASan/UBSan。Host 测试覆盖生产 codec/session
 
 Windows `cargo check --target x86_64-pc-windows-msvc` 只证明编译；在 ARM64 Windows VM 运行 x64 EXE 只能证明该兼容运行环境，不等于 x64 物理机或 VM 内原生编译。具体本轮测试计数和产物关联保存在本地验证报告中。
 
+## S4 可控测试对端
+
+`tools/siggen` 提供 EVKMini 上的 CDC 参考从机、可编程表、NACK、ACK 延迟和开漏卡线注入，用于给下面的 S3/S4 验收提供可控对端。命令、边界和操作顺序见 [siggen-control-peer.md](siggen-control-peer.md)。对端状态/计数是辅助证据，实际拉伸时长、ACK/NACK 和恢复脉冲仍以逻辑分析仪为准。
+
+```sh
+cmake -S tools/siggen/tests -B /tmp/siggen-native -G Ninja
+cmake --build /tmp/siggen-native
+ctest --test-dir /tmp/siggen-native --output-on-failure
+
+source tools/env.sh
+cmake -S tools/siggen -B tools/siggen/build -G Ninja \
+  -DBOARD=hpm6750evkmini -DHPM_BUILD_TYPE=flash_xip -DCMAKE_BUILD_TYPE=release
+cmake --build tools/siggen/build
+```
+
+这些命令不烧录。连接前必须按对端文档核对实际引脚、电平、上拉及探针位置；一份单路对端不能证明两路独立外部总线并发，多地址扫描也需配置多个独立应答设备。
+
 ## 必须上板的验收矩阵
 
 | ID | 设置与操作 | 通过条件与原始证据 |

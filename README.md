@@ -59,7 +59,7 @@ tools/
   env.sh                    HPM SDK、工具链、OpenOCD 路径
   flash.sh                  经板载 FT2232 烧录 ELF
   slave_test/               T1.9 对端主机（HPM6750EVKMini）
-  siggen/                   EVK 上的 CDC I2C 对端原型；本仓库无上板记录
+  siggen/                   EVKMini CDC 可编程 I2C 对端与故障注入；仍待上板验证
 ```
 
 HPM SDK、RISC-V GCC 和 OpenOCD 在仓库外，默认放在 `~/hpm/`。
