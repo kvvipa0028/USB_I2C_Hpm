@@ -1,0 +1,1 @@
+#define CONFIG_HPM_USBD_IRQn 3U
