@@ -328,6 +328,105 @@ fn successful_requests_consume_both_queues_once() {
 }
 
 #[test]
+fn only_exact_legacy_unsupported_capabilities_response_falls_back() {
+    let (mut bridge, state) = session();
+    state.borrow_mut().omit_replies = true;
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_CAPABILITIES, 1, 3, &[]));
+    assert_eq!(bridge.capabilities().unwrap(), Capabilities::legacy());
+    assert!(bridge.is_usable());
+    assert_eq!(state.borrow().requests, [vec![2, 1, 0, 0, 0, 0, 0, 0]]);
+    assert_clean(&state);
+}
+
+#[test]
+fn malformed_or_missing_capabilities_invalidates_without_fallback_or_retry() {
+    let mut nonzero_hpm = reply(CMD_CAPABILITIES, 1, 3, &[]);
+    nonzero_hpm[4] = 1;
+    let mut nonzero_reserved = reply(CMD_CAPABILITIES, 1, 3, &[]);
+    nonzero_reserved[3] = 1;
+    for malformed in [
+        reply(CMD_CAPABILITIES, 0, 3, &[]),
+        reply(CMD_I2C, 1, 3, &[]),
+        reply(CMD_CAPABILITIES, 1, 3, &[0]),
+        reply(CMD_CAPABILITIES, 1, 0, &[]),
+        reply(CMD_CAPABILITIES, 1, 2, &[]),
+        vec![CMD_CAPABILITIES, 1, 3],
+        nonzero_hpm,
+        nonzero_reserved,
+        vec![],
+    ] {
+        let (mut bridge, state) = session();
+        state.borrow_mut().omit_replies = true;
+        if !malformed.is_empty() {
+            state.borrow_mut().replies.push_back(malformed);
+        }
+        assert!(bridge.capabilities().is_err());
+        assert_eq!(state.borrow().requests.len(), 1);
+        assert_invalidated(&mut bridge, &state);
+    }
+}
+
+#[test]
+fn advertised_extension_is_parsed_and_port_transfer_runs_once() {
+    let (mut bridge, state) = session();
+    state.borrow_mut().omit_replies = true;
+    state.borrow_mut().replies.push_back(reply(
+        CMD_CAPABILITIES,
+        1,
+        0,
+        &[
+            1, 2, 5, 0, 0, 1, 0, 0, 0xa0, 0x86, 1, 0, 0x10, 0x27, 0, 0, 0x40, 0x42, 0x0f, 0,
+        ],
+    ));
+    let caps = bridge.capabilities().unwrap();
+    let request = TransferRequest {
+        port: 1,
+        addr: 0x50,
+        wdata: vec![0x12],
+        rlen: 2,
+        speed_hz: 400_000,
+    };
+    caps.validate_transfer(&request).unwrap();
+    state
+        .borrow_mut()
+        .replies
+        .push_back(reply(CMD_I2C_PORT, 2, 0, &[0x11, 0x22]));
+    assert_eq!(bridge.i2c_port(&request).unwrap(), [0x11, 0x22]);
+    assert_eq!(state.borrow().requests.len(), 2);
+    assert_eq!(state.borrow().requests[1][0], CMD_I2C_PORT);
+    assert_eq!(state.borrow().requests[1][8], 1);
+    assert!(bridge.is_usable());
+    assert_clean(&state);
+}
+
+#[test]
+fn port_failure_preserves_no_replay_and_session_rules() {
+    let request = TransferRequest {
+        port: 1,
+        addr: 0x50,
+        wdata: vec![0, 1],
+        rlen: 0,
+        speed_hz: 100_000,
+    };
+    for status in [1, 2] {
+        let (mut bridge, state) = session();
+        state.borrow_mut().status = status;
+        assert!(bridge.i2c_port(&request).is_err());
+        assert!(bridge.is_usable());
+        assert_eq!(state.borrow().requests.len(), 1);
+    }
+    let (mut bridge, state) = session();
+    state.borrow_mut().in_outcomes.push_back(Outcome::Timeout);
+    let error = bridge.i2c_port(&request).unwrap_err().to_string();
+    assert!(error.contains("may have executed and was not retried"));
+    assert_eq!(state.borrow().requests.len(), 1);
+    assert_invalidated(&mut bridge, &state);
+}
+
+#[test]
 fn firmware_errors_leave_a_usable_session_without_automatic_retry() {
     for (status, name) in [
         (1, "Nack"),

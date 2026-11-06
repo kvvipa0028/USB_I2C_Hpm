@@ -5,7 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context};
 use nusb::MaybeFuture;
 
-use crate::proto::{self, Reply, Status, CMD_I2C, CMD_PING, HDR, MAX_XFER, PING_DATA_MAX};
+use crate::proto::{
+    self, Capabilities, Reply, Status, TransferRequest, CAPABILITIES_DATA_LEN, CMD_CAPABILITIES,
+    CMD_I2C, CMD_I2C_PORT, CMD_PING, HDR, MAX_XFER, PING_DATA_MAX,
+};
 
 mod transport;
 use transport::{Transport, UsbTransport};
@@ -42,6 +45,7 @@ fn is_bridge(d: &nusb::DeviceInfo) -> bool {
 
 pub struct Bridge {
     session: Session<UsbTransport>,
+    capabilities: Option<Capabilities>,
 }
 
 impl Bridge {
@@ -80,7 +84,10 @@ impl Bridge {
         session.synchronize().map_err(|e| {
             anyhow!("could not synchronize bridge: {e:#}; unplug/replug USB if reconnect fails")
         })?;
-        Ok(Bridge { session })
+        Ok(Bridge {
+            session,
+            capabilities: None,
+        })
     }
 
     /// False after a USB or protocol failure. Such a session cannot be reused:
@@ -96,6 +103,30 @@ impl Bridge {
 
     pub fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
         self.session.i2c(addr, wdata, rlen)
+    }
+
+    /// Read-only discovery, cached for this connection. Only a complete old-firmware
+    /// BadRequest reply permits legacy fallback; transport failures fail closed.
+    pub fn capabilities(&mut self) -> anyhow::Result<Capabilities> {
+        self.session.transport()?;
+        if let Some(caps) = &self.capabilities {
+            return Ok(caps.clone());
+        }
+        let caps = self.session.capabilities()?;
+        self.capabilities = Some(caps.clone());
+        Ok(caps)
+    }
+
+    /// Explicit port/speed access. Original firmware is limited to CH0/100 kHz;
+    /// it is never sent an extension transfer or silently reconfigured.
+    pub fn i2c_port(&mut self, request: &TransferRequest) -> anyhow::Result<Vec<u8>> {
+        let caps = self.capabilities()?;
+        caps.validate_transfer(request).map_err(|e| anyhow!(e))?;
+        if caps.supports_port_transfer {
+            self.session.i2c_port(request)
+        } else {
+            self.session.i2c(request.addr, &request.wdata, request.rlen)
+        }
     }
 }
 
@@ -134,7 +165,7 @@ impl<T: Transport> Session<T> {
             // Drop endpoints even if cancellation has not finished. nusb owns
             // their buffers until completion; never wait indefinitely here.
         }
-        let uncertainty = if cmd == CMD_I2C {
+        let uncertainty = if matches!(cmd, CMD_I2C | CMD_I2C_PORT) {
             "; I2C operation may have executed and was not retried; USB cancellation cannot undo it"
         } else {
             ""
@@ -252,6 +283,45 @@ impl<T: Transport> Session<T> {
             r.data[0],
             String::from_utf8_lossy(&r.data[1..])
         ))
+    }
+
+    fn capabilities(&mut self) -> anyhow::Result<Capabilities> {
+        let seq = self.next_seq();
+        let reply = self.transact(
+            CMD_CAPABILITIES,
+            proto::encode_capabilities(seq),
+            HDR + CAPABILITIES_DATA_LEN,
+        )?;
+        proto::decode_capabilities(&reply).map_err(|e| self.fail(CMD_CAPABILITIES, anyhow!(e)))
+    }
+
+    fn i2c_port(&mut self, request: &TransferRequest) -> anyhow::Result<Vec<u8>> {
+        self.transport()?;
+        let seq = self.next_seq();
+        let encoded = proto::encode_i2c_port(seq, request).map_err(|e| anyhow!(e))?;
+        let reply = self.transact(CMD_I2C_PORT, encoded, HDR + request.rlen)?;
+        if matches!(reply.status, Status::Unknown(_))
+            || (reply.status != Status::Ok && !reply.data.is_empty())
+            || (reply.status == Status::Ok && reply.hpm_stat != 0)
+        {
+            return Err(self.fail(CMD_I2C_PORT, anyhow!("invalid port I2C reply")));
+        }
+        if reply.status != Status::Ok {
+            bail!(
+                "CH{} I2C 0x{:02x}: {:?} (hpm_stat {})",
+                request.port,
+                request.addr,
+                reply.status,
+                reply.hpm_stat
+            );
+        }
+        if reply.data.len() != request.rlen {
+            return Err(self.fail(
+                CMD_I2C_PORT,
+                anyhow!("expected {} bytes, got {}", request.rlen, reply.data.len()),
+            ));
+        }
+        Ok(reply.data)
     }
 
     fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
