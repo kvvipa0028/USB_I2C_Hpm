@@ -8,3 +8,13 @@ target/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Keep Markdown reports visible; ignore other local validation outputs.
+/outputs/**
+!/outputs/**/
+!/outputs/**/*.md
+
+# Dependency and source snapshot directories are not report deliverables.
+/outputs/**/xwin-cache/
+/outputs/**/xwin-env/
+/outputs/**/bundle/source/
