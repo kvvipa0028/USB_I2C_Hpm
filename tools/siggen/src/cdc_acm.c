@@ -1,12 +1,14 @@
 /*
  * CDC ACM backend for sig5301 (adapted from the SDK's cdc_acm_vcom sample).
  * RX bytes land in a ring buffer for the line-based command parser;
- * TX goes through cdc_write() (busy-waits on the endpoint).
+ * TX is single-flight and non-blocking; a stalled host cannot stop deadlines.
  */
 
 #include "usbd_core.h"
 #include "usbd_cdc_acm.h"
 #include "cdc_acm.h"
+#include "cdc_buffer.h"
+#include "siggen_board.h"
 
 /*!< endpoint address */
 #define CDC_IN_EP  0x81
@@ -75,13 +77,13 @@ static const uint8_t *other_speed_config_descriptor_callback(uint8_t speed)
     return speed == USB_SPEED_HIGH ? other_speed_config_descriptor_hs : other_speed_config_descriptor_fs;
 }
 
-static const uint8_t *string_descriptor_callback(uint8_t speed, uint8_t index)
+static const char *string_descriptor_callback(uint8_t speed, uint8_t index)
 {
     (void)speed;
     if (index >= sizeof(string_descriptors) / sizeof(string_descriptors[0])) {
         return NULL;
     }
-    return (const uint8_t *)string_descriptors[index];
+    return string_descriptors[index];
 }
 
 const struct usb_descriptor cdc_descriptor = {
@@ -93,45 +95,64 @@ const struct usb_descriptor cdc_descriptor = {
 };
 
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t read_buffer[512];
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t write_buffer[2048];
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t write_buffer[SIGGEN_CDC_TX_CAP];
 volatile bool cdc_dtr;
-static volatile bool ep_tx_busy;
+static bool configured, ep_tx_busy;
+/* Kept separate from logical connection state: a DTR drop does not cancel an
+ * IN DMA transfer. Do not reuse its buffer until completion or USB reset. */
+static siggen_cdc_buffer_t buffer;
 
-/* RX ring buffer for the line parser */
-#define RX_RING_SIZE 1024U
-static volatile uint8_t rx_ring[RX_RING_SIZE];
-static volatile uint16_t rx_head, rx_tail;
-
+static void lost(void)
+{
+    siggen_cdc_buffer_connected(&buffer, false);
+}
+static void arm_read(uint8_t busid)
+{
+    uint16_t mps = usbd_get_ep_mps(busid, CDC_OUT_EP);
+    if (mps == 0 || mps > sizeof(read_buffer) ||
+        usbd_ep_start_read(busid, CDC_OUT_EP, read_buffer, mps) != 0) {
+        configured = false;
+        lost();
+    }
+}
 static void usbd_event_handler(uint8_t busid, uint8_t event)
 {
     switch (event) {
     case USBD_EVENT_CONFIGURED:
-        usbd_ep_start_read(busid, CDC_OUT_EP, read_buffer, usbd_get_ep_mps(busid, CDC_OUT_EP));
+        configured = true;
+        siggen_cdc_buffer_connected(&buffer, cdc_dtr);
+        arm_read(busid);
+        break;
+    case USBD_EVENT_RESET:
+    case USBD_EVENT_DISCONNECTED:
+        configured = false;
+        cdc_dtr = false;
+        ep_tx_busy = false;
+        lost();
         break;
     default:
         break;
     }
 }
-
 static void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
-    for (uint32_t i = 0; i < nbytes; i++) {
-        uint16_t next = (uint16_t)((rx_head + 1) % RX_RING_SIZE);
-        if (next != rx_tail) {
-            rx_ring[rx_head] = read_buffer[i];
-            rx_head = next;
-        }
-    }
-    usbd_ep_start_read(busid, ep, read_buffer, usbd_get_ep_mps(busid, ep));
+    (void)ep;
+    if (!configured) return;
+    if (nbytes > sizeof(read_buffer)) { configured = false; lost(); return; }
+    siggen_cdc_buffer_rx(&buffer, read_buffer, nbytes);
+    arm_read(busid);
 }
-
 static void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
-    if ((nbytes % usbd_get_ep_mps(busid, ep)) == 0 && nbytes != 0) {
-        usbd_ep_start_write(busid, ep, NULL, 0); /* zlp */
-    } else {
-        ep_tx_busy = false;
+    if (!configured || !ep_tx_busy) return;
+    uint16_t mps = usbd_get_ep_mps(busid, ep);
+    if (mps != 0 && nbytes != 0 && nbytes % mps == 0) {
+        if (usbd_ep_start_write(busid, ep, NULL, 0) == 0) return;
+        configured = false;
+        lost();
     }
+    ep_tx_busy = false;
+    siggen_cdc_buffer_tx_done(&buffer);
 }
 
 static struct usbd_endpoint cdc_out_ep = { .ep_addr = CDC_OUT_EP, .ep_cb = usbd_cdc_acm_bulk_out };
@@ -141,6 +162,7 @@ static struct usbd_interface intf1;
 
 void cdc_acm_init(uint8_t busid, uint32_t reg_base)
 {
+    siggen_cdc_buffer_init(&buffer);
     usbd_desc_register(busid, &cdc_descriptor);
     usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &intf0));
     usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &intf1));
@@ -154,31 +176,50 @@ void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
     (void)busid;
     (void)intf;
     cdc_dtr = dtr;
+    siggen_cdc_buffer_connected(&buffer, configured && dtr);
 }
-
 int cdc_getchar(void)
 {
-    if (rx_tail == rx_head) {
-        return -1;
-    }
-    uint8_t c = rx_ring[rx_tail];
-    rx_tail = (uint16_t)((rx_tail + 1) % RX_RING_SIZE);
+    uint32_t irq = siggen_board_lock();
+    int c = siggen_cdc_buffer_getchar(&buffer);
+    siggen_board_unlock(irq);
     return c;
 }
-
-void cdc_write(const char *buf, uint32_t len)
+bool cdc_can_write(void)
 {
-    if (len == 0 || !cdc_dtr) {
-        return;
+    uint32_t irq = siggen_board_lock();
+    bool ready = !ep_tx_busy && siggen_cdc_buffer_can_write(&buffer);
+    siggen_board_unlock(irq);
+    return ready;
+}
+bool cdc_take_session_lost(void)
+{
+    uint32_t irq = siggen_board_lock();
+    bool result = siggen_cdc_buffer_take_session_lost(&buffer);
+    siggen_board_unlock(irq);
+    return result;
+}
+void cdc_stats(uint32_t *rx_overflows, uint32_t *tx_rejected)
+{
+    uint32_t irq = siggen_board_lock();
+    *rx_overflows = buffer.rxoverflow;
+    *tx_rejected = buffer.txreject;
+    siggen_board_unlock(irq);
+}
+bool cdc_write(const char *data, uint32_t len)
+{
+    uint32_t irq = siggen_board_lock();
+    bool accepted = !ep_tx_busy && siggen_cdc_buffer_write(&buffer, (const uint8_t *)data, len);
+    if (accepted) {
+        memcpy(write_buffer, siggen_cdc_buffer_tx_data(&buffer), len);
+        ep_tx_busy = true;
+        if (usbd_ep_start_write(0, CDC_IN_EP, write_buffer, len) != 0) {
+            ep_tx_busy = false;
+            configured = false;
+            lost();
+            accepted = false;
+        }
     }
-    while (len > sizeof(write_buffer)) {
-        cdc_write(buf, sizeof(write_buffer));
-        buf += sizeof(write_buffer);
-        len -= sizeof(write_buffer);
-    }
-    ep_tx_busy = true;
-    memcpy(write_buffer, buf, len);
-    usbd_ep_start_write(0, CDC_IN_EP, write_buffer, len);
-    while (ep_tx_busy) {
-    }
+    siggen_board_unlock(irq);
+    return accepted;
 }

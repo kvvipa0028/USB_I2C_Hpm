@@ -4,6 +4,8 @@ These cases never claim clock accuracy, physical concurrency, or target coverage
 Every subprocess starts a new model, so stateful checks stay in one transaction.
 """
 
+from cases.control import build_control_cases
+
 
 def _case(case_id: str, args: list[str], expected: dict, exit_code: int = 0) -> dict:
     return {"id": case_id, "args": args, "expected": expected, "exit_code": exit_code}
@@ -62,4 +64,4 @@ def build_cases() -> list[dict]:
     ], {"ok": False, "error": {"code": "operation_failed", "result_unknown": False}}, 1))
     cases.append(_case("TC-CLI-ARGUMENT-ERROR", ["read", "not-an-address", "1"],
                        {"ok": False, "error": {"code": "invalid_argument", "result_unknown": False}}, 2))
-    return cases
+    return cases + build_control_cases()

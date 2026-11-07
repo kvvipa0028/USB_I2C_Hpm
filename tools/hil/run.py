@@ -29,6 +29,15 @@ HARDWARE_CASES = [
     ("TC-S2-FAULT-ISOLATION", "one port NACK/SCL timeout; the other completes independently"),
     ("TC-S2-USB-FAILURE", "FS/HS packet boundaries, disconnect/late reply, no write replay"),
     ("TC-S2-WINDOWS", "clean Windows 10/11 x64 WinUSB enumeration, PING and I2C smoke"),
+    ("TC-S3-ROLES", "M/M, M/S, S/M, S/S external peers; busy config rejection and unchanged other port"),
+    ("TC-S3-TABLE-CAS", "PC snapshot/atomic fragment CAS against external writes; offset wrap and prefetch-aware oracle"),
+    ("TC-S3-TABLE-SERVICE", "two ports at 1 MHz; eligible PC requests <= 2000 us; measured IRQ lock WCET"),
+    ("TC-S4-STRETCH", "10 ms allowed stretch, per-low and total deadlines; raw SCL timing and partial execution"),
+    ("TC-S4-SCAN", "known address set; address-only START/STOP, NACK, fault, cancellation and partial results"),
+    ("TC-S4-RECOVERY", "SCL/SDA stuck, release after 9 clocks, STOP, mux restoration and no active-high drive"),
+    ("TC-S5-FRONTEND", "approved circuit/PCB/BOM; 1.8/2.5/3.3/5 V, pullups, ADC validity, protection/ESD/power"),
+    ("TC-S6-CONTROL-USB", "config/table/recovery disconnect and late replies; no replay; refreshed state after reconnect"),
+    ("TC-S6-GUI-DEVICE", "USB GUI role/table/scan/recovery, cancel and physical disconnect on macOS and Windows"),
 ]
 
 
@@ -79,8 +88,48 @@ def run_usb_smoke(adapter: CliAdapter) -> tuple[list[dict], str]:
         reason = "no USB bridge connected" if not devices else "USB smoke requires exactly one bridge"
         results.append({"id": "TC-USB-CONNECTION", "evidence": "usb_protocol", "status": "BLOCKED", "reason": reason})
         return results, "BLOCKED"
-    results.append(run_case(adapter, {"id": "TC-USB-INFO", "args": ["info"],
-                                     "expected": {"ok": True, "data": {"capabilities": {}}}, "exit_code": 0}, "usb_protocol"))
+    info = run_case(adapter, {"id": "TC-USB-INFO", "args": ["info"],
+                             "expected": {"ok": True, "command": "info", "data": {
+                                 "capabilities": {}, "source": "device_reply"}}, "exit_code": 0}, "usb_protocol")
+    results.append(info)
+    if info["status"] != "PASS":
+        return results, "FAIL"
+    data = info["invocation"]["response"]["data"]
+    count = data["capabilities"].get("port_count")
+    control = data.get("control_capabilities")
+    # The CLI produces one entry per negotiated port, including explicit
+    # unsupported entries for legacy firmware. Do not infer a missing entry.
+    if (type(count) is not int or not 1 <= count <= 2 or not isinstance(control, list)
+            or len(control) != count or any(
+                not isinstance(cap, dict) or type(cap.get("port")) is not int
+                or cap["port"] != port
+                or any(type(cap.get(flag)) is not bool for flag in (
+                    "supports_role_config", "supports_frontend_get"))
+                for port, cap in enumerate(control))):
+        info.update(status="FAIL", reason="invalid per-port control capability matrix")
+        return results, "FAIL"
+    for cap in control:
+        port = cap["port"]
+        for command, supported in (("port-state", cap["supports_role_config"]),
+                                   ("frontend-status", cap["supports_frontend_get"])):
+            expected = {"command": command, "ok": supported}
+            if supported:
+                expected["data"] = {"port": port, "source": "device_reply"}
+                if command == "port-state":
+                    expected["data"].update(measured_speed_hz=None, speed_evidence="register_calculation")
+            else:
+                expected["error"] = {
+                    "code": "operation_failed", "status": "unsupported", "status_code": 6,
+                    "hpm_stat": 0, "session_invalidated": False, "result_unknown": False,
+                }
+            results.append(run_case(adapter, {
+                "id": f"TC-USB-{command.upper()}-CH{port}", "args": ["--port", str(port), command],
+                "expected": expected, "exit_code": 0 if supported else 1,
+            }, "usb_protocol" if supported else "host_capability_gate"))
+            if results[-1]["status"] != "PASS":
+                # The operation may have invalidated its session. Stop this
+                # smoke run rather than opening more sessions after failure.
+                return results, "FAIL"
     return results, "USB_SMOKE_PASS" if all(r["status"] == "PASS" for r in results) else "FAIL"
 
 
@@ -129,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         "counts": {
             "model_pass": sum(r["status"] == "PASS" and r["evidence"] == "offline_model" for r in results),
             "usb_protocol_pass": sum(r["status"] == "PASS" and r["evidence"] == "usb_protocol" for r in results),
+            "capability_gate_pass": sum(r["status"] == "PASS" and r["evidence"] == "host_capability_gate" for r in results),
             "hardware_pass": 0,
             "fail": sum(r["status"] == "FAIL" for r in results),
             "blocked": sum(r["status"] == "BLOCKED" for r in results),

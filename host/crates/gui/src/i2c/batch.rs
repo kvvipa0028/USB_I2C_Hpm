@@ -1,6 +1,7 @@
 //! Two independent port transactions, not a script or sequential command list.
 
 use eframe::egui;
+use usb_i2c::control::PortRole;
 use usb_i2c::proto::Capabilities;
 
 use super::parse::{parse_addr, parse_bytes, parse_len};
@@ -33,6 +34,8 @@ pub struct Batch {
     drafts: [Draft; 2],
     caps: Capabilities,
     offline: bool,
+    roles: [Option<PortRole>; 2],
+    role_required: [bool; 2],
     pub result: Vec<String>,
 }
 
@@ -42,6 +45,8 @@ impl Default for Batch {
             drafts: [Draft::default(), Draft::default()],
             caps: Capabilities::legacy(),
             offline: false,
+            roles: [None; 2],
+            role_required: [false; 2],
             result: Vec::new(),
         }
     }
@@ -51,9 +56,20 @@ impl Batch {
     pub fn set_connection(&mut self, caps: &Capabilities, offline: bool) {
         self.caps = caps.clone();
         self.offline = offline;
+        self.roles = [None; 2];
+        self.role_required = [false; 2];
         self.result.clear();
         for d in &mut self.drafts {
             d.speed_hz = caps.fixed_speed_hz.to_string();
+        }
+    }
+
+    pub(super) fn set_role(&mut self, port: u8, role: Option<PortRole>, required: bool) {
+        if let Some(slot) = self.roles.get_mut(usize::from(port)) {
+            *slot = role;
+        }
+        if let Some(slot) = self.role_required.get_mut(usize::from(port)) {
+            *slot = required;
         }
     }
 
@@ -65,6 +81,11 @@ impl Batch {
             .iter()
             .enumerate()
             .map(|(port, d)| {
+                if self.roles[port] == Some(PortRole::Slave)
+                    || (self.role_required[port] && self.roles[port].is_none())
+                {
+                    return Err(format!("CH{port} 主机角色未确认，不能提交双端口批次"));
+                }
                 let wdata = if d.op == Op::Read {
                     Vec::new()
                 } else {
@@ -288,10 +309,8 @@ mod tests {
                         edit_text_rects(&shape.shape, &mut fields);
                     }
                     for value in ["0x50", "100000"] {
-                        let matching: Vec<_> = fields
-                            .iter()
-                            .filter(|(text, _)| text == value)
-                            .collect();
+                        let matching: Vec<_> =
+                            fields.iter().filter(|(text, _)| text == value).collect();
                         assert_eq!(matching.len(), 2, "both ports must show {value}");
                         for (_, rect) in matching {
                             assert!(page_rect.contains_rect(*rect), "{value}: {rect:?}");
@@ -321,5 +340,23 @@ mod tests {
         assert!(req.iter().all(|r| r.offline));
         batch.drafts[0].read_len = "256".into();
         assert!(batch.requests().unwrap_err().contains("最多"));
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn batch_requires_both_confirmed_master_roles_when_control_is_advertised() {
+        let mut batch = Batch::default();
+        batch.set_connection(usb_i2c::device::Device::offline().capabilities(), true);
+        batch.set_role(0, Some(PortRole::Master), true);
+        batch.set_role(1, None, true);
+        assert!(batch.requests().is_err());
+        batch.set_role(1, Some(PortRole::Slave), true);
+        assert!(batch.requests().is_err());
+        batch.set_role(1, Some(PortRole::Master), true);
+        assert!(batch.requests().is_ok());
     }
 }

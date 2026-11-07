@@ -11,7 +11,10 @@ use crate::proto::{
     PING_DATA_MAX,
 };
 
+mod control;
 mod transport;
+use control::control_transfer_timeout;
+pub(crate) use control::ControlReplyError;
 use transport::{Transport, UsbTransport};
 
 const VID: u16 = 0x1209;
@@ -47,6 +50,7 @@ fn is_bridge(d: &nusb::DeviceInfo) -> bool {
 pub struct Bridge {
     session: Session<UsbTransport>,
     capabilities: Option<Capabilities>,
+    control_capabilities: Vec<crate::control::ControlCapabilities>,
 }
 
 /// The exact whole-batch rejection proves neither port was executed.
@@ -100,6 +104,7 @@ impl Bridge {
         Ok(Bridge {
             session,
             capabilities: None,
+            control_capabilities: Vec::new(),
         })
     }
 
@@ -115,7 +120,9 @@ impl Bridge {
     }
 
     pub fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
-        self.session.i2c(addr, wdata, rlen)
+        let caps = self.control_capabilities(0)?;
+        self.session
+            .i2c_timeout(addr, wdata, rlen, control_transfer_timeout(&caps))
     }
 
     /// Read-only discovery, cached for this connection. Only a complete old-firmware
@@ -135,10 +142,13 @@ impl Bridge {
     pub fn i2c_port(&mut self, request: &TransferRequest) -> anyhow::Result<Vec<u8>> {
         let caps = self.capabilities()?;
         caps.validate_transfer(request).map_err(|e| anyhow!(e))?;
+        let control = self.control_capabilities(request.port)?;
+        let timeout = control_transfer_timeout(&control);
         if caps.supports_port_transfer {
-            self.session.i2c_port(request)
+            self.session.i2c_port_timeout(request, timeout)
         } else {
-            self.session.i2c(request.addr, &request.wdata, request.rlen)
+            self.session
+                .i2c_timeout(request.addr, &request.wdata, request.rlen, timeout)
         }
     }
 
@@ -148,7 +158,12 @@ impl Bridge {
         self.capabilities()?
             .validate_batch(requests)
             .map_err(|e| anyhow!(e))?;
-        self.session.batch(requests)
+        let mut timeout = Duration::ZERO;
+        for request in requests {
+            let caps = self.control_capabilities(request.port)?;
+            timeout = timeout.max(control_transfer_timeout(&caps));
+        }
+        self.session.batch_timeout(requests, timeout)
     }
 }
 
@@ -187,8 +202,11 @@ impl<T: Transport> Session<T> {
             // Drop endpoints even if cancellation has not finished. nusb owns
             // their buffers until completion; never wait indefinitely here.
         }
-        let uncertainty = if matches!(cmd, CMD_I2C | CMD_I2C_PORT | CMD_I2C_BATCH) {
-            "; I2C operation may have executed and was not retried; USB cancellation cannot undo it"
+        let uncertainty = if matches!(
+            cmd,
+            CMD_I2C | CMD_I2C_PORT | CMD_I2C_BATCH | 0x14 | 0x16 | 0x18 | 0x1a
+        ) {
+            "; operation may have executed and was not retried; USB cancellation cannot undo it"
         } else {
             ""
         };
@@ -203,13 +221,31 @@ impl<T: Transport> Session<T> {
     }
 
     fn transact(&mut self, cmd: u8, req: Vec<u8>, reply_max: usize) -> anyhow::Result<Reply> {
+        self.transact_timeout(cmd, req, reply_max, TIMEOUT)
+    }
+
+    fn transact_timeout(
+        &mut self,
+        cmd: u8,
+        req: Vec<u8>,
+        reply_max: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Reply> {
         let transport = self.transport()?;
         let seq = req[1];
         transport.submit_in(reply_max);
         let sent_len = transport.submit_out(req);
+        let deadline = Instant::now() + timeout;
         let result = (|| {
-            wait_out(transport, sent_len, TIMEOUT)?;
-            let bytes = wait_in(transport, TIMEOUT)?;
+            wait_out(
+                transport,
+                sent_len,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            let bytes = wait_in(
+                transport,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
             if bytes.len() > reply_max {
                 bail!("reply exceeds expected maximum of {reply_max} bytes");
             }
@@ -317,11 +353,20 @@ impl<T: Transport> Session<T> {
         proto::decode_capabilities(&reply).map_err(|e| self.fail(CMD_CAPABILITIES, anyhow!(e)))
     }
 
+    #[cfg(test)]
     fn i2c_port(&mut self, request: &TransferRequest) -> anyhow::Result<Vec<u8>> {
+        self.i2c_port_timeout(request, TIMEOUT)
+    }
+
+    fn i2c_port_timeout(
+        &mut self,
+        request: &TransferRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
         self.transport()?;
         let seq = self.next_seq();
         let encoded = proto::encode_i2c_port(seq, request).map_err(|e| anyhow!(e))?;
-        let reply = self.transact(CMD_I2C_PORT, encoded, HDR + request.rlen)?;
+        let reply = self.transact_timeout(CMD_I2C_PORT, encoded, HDR + request.rlen, timeout)?;
         if matches!(reply.status, Status::Unknown(_))
             || (reply.status != Status::Ok && !reply.data.is_empty())
             || (reply.status == Status::Ok && reply.hpm_stat != 0)
@@ -329,6 +374,13 @@ impl<T: Transport> Session<T> {
             return Err(self.fail(CMD_I2C_PORT, anyhow!("invalid port I2C reply")));
         }
         if reply.status != Status::Ok {
+            if reply.status == Status::BadRequest && reply.hpm_stat == 0 {
+                return Err(ControlReplyError {
+                    status: crate::control::ControlStatus::BadRequest,
+                    hpm_stat: 0,
+                }
+                .into());
+            }
             bail!(
                 "CH{} I2C 0x{:02x}: {:?} (hpm_stat {})",
                 request.port,
@@ -346,27 +398,61 @@ impl<T: Transport> Session<T> {
         Ok(reply.data)
     }
 
+    #[cfg(test)]
     fn batch(&mut self, requests: &[TransferRequest]) -> anyhow::Result<Vec<TransferOutcome>> {
+        self.batch_timeout(requests, TIMEOUT)
+    }
+
+    fn batch_timeout(
+        &mut self,
+        requests: &[TransferRequest],
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<TransferOutcome>> {
         self.transport()?;
         let seq = self.next_seq();
         let encoded = proto::encode_batch(seq, requests).map_err(|e| anyhow!(e))?;
-        let reply = self.transact(CMD_I2C_BATCH, encoded, proto::batch_reply_max(requests))?;
+        let reply = self.transact_timeout(
+            CMD_I2C_BATCH,
+            encoded,
+            proto::batch_reply_max(requests),
+            timeout,
+        )?;
         if reply.status == Status::BadRequest && reply.hpm_stat == 0 && reply.data.is_empty() {
             return Err(BatchRejectedBeforeExecution.into());
         }
         proto::decode_batch(&reply, requests).map_err(|e| self.fail(CMD_I2C_BATCH, anyhow!(e)))
     }
 
+    #[cfg(test)]
     fn i2c(&mut self, addr: u8, wdata: &[u8], rlen: usize) -> anyhow::Result<Vec<u8>> {
+        self.i2c_timeout(addr, wdata, rlen, TIMEOUT)
+    }
+
+    fn i2c_timeout(
+        &mut self,
+        addr: u8,
+        wdata: &[u8],
+        rlen: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
         self.transport()?;
         let seq = self.next_seq();
         let req = proto::encode_i2c(seq, addr, wdata, rlen).map_err(|e| anyhow!(e))?;
-        let r = self.transact(CMD_I2C, req, HDR + rlen)?;
-        if matches!(r.status, Status::Unknown(_)) || (r.status != Status::Ok && !r.data.is_empty())
+        let r = self.transact_timeout(CMD_I2C, req, HDR + rlen, timeout)?;
+        if matches!(r.status, Status::Unknown(_))
+            || (r.status != Status::Ok && !r.data.is_empty())
+            || (r.status == Status::Ok && r.hpm_stat != 0)
         {
             return Err(self.fail(CMD_I2C, anyhow!("invalid I2C status reply: {:?}", r.status)));
         }
         if r.status != Status::Ok {
+            if r.status == Status::BadRequest && r.hpm_stat == 0 {
+                return Err(ControlReplyError {
+                    status: crate::control::ControlStatus::BadRequest,
+                    hpm_stat: 0,
+                }
+                .into());
+            }
             // These are complete, matched firmware replies, not USB failures.
             // Keeping the session does not imply that retrying an I2C write is safe.
             bail!("I2C 0x{addr:02x}: {:?} (hpm_stat {})", r.status, r.hpm_stat);

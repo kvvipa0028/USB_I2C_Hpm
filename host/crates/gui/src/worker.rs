@@ -4,10 +4,18 @@
 //! Device capabilities gate port and speed selection; requests are never replayed.
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use eframe::egui;
 use usb_i2c::bridge::{list_devices, DeviceInfo};
-use usb_i2c::device::{BackendKind, Device};
+use usb_i2c::control::{
+    ControlCapabilities, FrontendConfig, FrontendState, PortConfig, PortState, RecoveryResult,
+    ScanResult, TableCommit, TableSnapshot,
+};
+use usb_i2c::device::{BackendKind, Device, DeviceError};
 use usb_i2c::proto::{Capabilities, TransferOutcome, TransferRequest};
 
 pub const DISCONNECT_FIRST: &str = "已连接设备，先点断开";
@@ -45,6 +53,78 @@ pub struct Connection {
     pub firmware: String,
     pub capabilities: Capabilities,
     pub offline: bool,
+    pub control_capabilities: Vec<ControlCapabilities>,
+    pub port_states: Vec<PortState>,
+}
+
+/// A single operation submitted by the window. Scan cancellation is shared
+/// independently of the job queue so it can interrupt a running scan.
+#[derive(Debug, Clone)]
+pub enum ControlRequest {
+    State(u8),
+    Configure {
+        port: u8,
+        config: PortConfig,
+        expected: Option<u64>,
+    },
+    TableRead {
+        port: u8,
+        offset: u16,
+        len: u16,
+    },
+    TableWrite {
+        port: u8,
+        offset: u16,
+        data: Vec<u8>,
+        expected: Option<u64>,
+    },
+    Scan {
+        port: u8,
+        cancel: Arc<AtomicBool>,
+    },
+    Recover(u8),
+    FrontendGet(u8),
+    FrontendSet {
+        port: u8,
+        config: FrontendConfig,
+        expected: u64,
+    },
+}
+
+impl ControlRequest {
+    pub fn port(&self) -> u8 {
+        match self {
+            Self::State(p) | Self::Recover(p) | Self::FrontendGet(p) => *p,
+            Self::Configure { port, .. }
+            | Self::TableRead { port, .. }
+            | Self::TableWrite { port, .. }
+            | Self::Scan { port, .. }
+            | Self::FrontendSet { port, .. } => *port,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::State(_) => "读取端口配置",
+            Self::Configure { .. } => "应用端口配置",
+            Self::TableRead { .. } => "读取从机表",
+            Self::TableWrite { .. } => "下发从机表",
+            Self::Scan { .. } => "扫描地址",
+            Self::Recover(_) => "恢复总线",
+            Self::FrontendGet(_) => "读取前端状态",
+            Self::FrontendSet { .. } => "应用前端配置",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ControlReply {
+    State(PortState),
+    Table(TableSnapshot),
+    Committed(TableCommit),
+    Scan(ScanResult),
+    Recovered(RecoveryResult),
+    Frontend(FrontendState),
 }
 
 pub enum Job {
@@ -55,12 +135,18 @@ pub enum Job {
     Disconnect,
     Transfer(Transfer),
     Batch(Vec<Transfer>),
+    Control(ControlRequest),
 }
 
 pub enum Event {
     Devices(Result<Vec<DeviceInfo>, String>),
     Connected(Result<Connection, String>),
     Disconnected,
+    Control {
+        request: ControlRequest,
+        result: Result<ControlReply, DeviceError>,
+        connection_lost: bool,
+    },
     Batch {
         transfers: Vec<Transfer>,
         result: Result<Vec<TransferOutcome>, String>,
@@ -100,6 +186,27 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                 bridge = None;
                 Event::Disconnected
             }
+            Job::Control(request) => {
+                let result = match bridge.as_mut() {
+                    Some(device) => run_control(device, &request),
+                    None => Err(DeviceError {
+                        message: "未连接，先点连接".into(),
+                        session_invalidated: false,
+                        result_unknown: false,
+                        status: None,
+                        hpm_stat: None,
+                    }),
+                };
+                let connection_lost = bridge.as_ref().is_none_or(|b| !b.is_usable());
+                if connection_lost {
+                    bridge = None;
+                }
+                Event::Control {
+                    request,
+                    result,
+                    connection_lost,
+                }
+            }
             Job::Batch(transfers) => {
                 let (result, usable) = match bridge.as_mut() {
                     Some(b) => {
@@ -136,7 +243,7 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                         rlen: t.rlen,
                         speed_hz: t.speed_hz,
                     })
-                    .map_err(|e| e.to_string());
+                    .map_err(transfer_error_text);
                 (result, b.is_usable())
             }),
         };
@@ -147,13 +254,69 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     }
 }
 
+fn transfer_error_text(error: DeviceError) -> String {
+    // A matched I2C error can preserve USB while a write has already changed
+    // the target. Keep that diagnostic before converting the legacy event to
+    // text; transport loss gets its reconnect warning in transfer_bridge.
+    if error.result_unknown && !error.session_invalidated {
+        format!("写入结果未知，请读回确认后再操作；未自动重试。{}", error)
+    } else {
+        error.to_string()
+    }
+}
+
 fn connection_info(mut device: Device) -> Result<(Device, Connection), String> {
+    let control_capabilities = device.control_capabilities().to_vec();
+    let mut port_states = Vec::new();
+    for cap in &control_capabilities {
+        if cap.supports_role_config {
+            port_states.push(device.port_state(cap.port).map_err(|e| e.to_string())?);
+        }
+    }
     let info = Connection {
         firmware: device.ping_line().map_err(|e| e.to_string())?,
         capabilities: device.capabilities().clone(),
         offline: device.backend() == BackendKind::Offline,
+        control_capabilities,
+        port_states,
     };
     Ok((device, info))
+}
+
+fn run_control(device: &mut Device, request: &ControlRequest) -> Result<ControlReply, DeviceError> {
+    match request {
+        ControlRequest::State(port) => device.port_state(*port).map(ControlReply::State),
+        ControlRequest::Configure {
+            port,
+            config,
+            expected,
+        } => device
+            .configure_port(*port, config, *expected)
+            .map(ControlReply::State),
+        ControlRequest::TableRead { port, offset, len } => device
+            .table_read(*port, *offset, *len)
+            .map(ControlReply::Table),
+        ControlRequest::TableWrite {
+            port,
+            offset,
+            data,
+            expected,
+        } => device
+            .table_write(*port, *offset, data, *expected)
+            .map(ControlReply::Committed),
+        ControlRequest::Scan { port, cancel } => device
+            .scan(*port, || cancel.load(Ordering::Relaxed))
+            .map(ControlReply::Scan),
+        ControlRequest::Recover(port) => device.recover(*port).map(ControlReply::Recovered),
+        ControlRequest::FrontendGet(port) => device.frontend_get(*port).map(ControlReply::Frontend),
+        ControlRequest::FrontendSet {
+            port,
+            config,
+            expected,
+        } => device
+            .frontend_set(*port, config, *expected)
+            .map(ControlReply::Frontend),
+    }
 }
 
 /// Keep the lifecycle guard outside the opener so a rejected Connect cannot
@@ -223,6 +386,8 @@ mod tests {
             firmware: firmware.into(),
             capabilities: Capabilities::legacy(),
             offline: false,
+            control_capabilities: Vec::new(),
+            port_states: Vec::new(),
         }
     }
 
@@ -411,5 +576,121 @@ mod tests {
         }
         jobs.send(Job::Disconnect).unwrap();
         assert!(matches!(receive(), Event::Disconnected));
+    }
+
+    #[test]
+    fn control_worker_keeps_typed_conflict_and_does_not_retry_or_replace_table() {
+        use usb_i2c::control::{ControlStatus, PortRole};
+        let (jobs, events) = spawn(egui::Context::default());
+        let receive = || {
+            events
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        };
+        jobs.send(Job::ConnectOffline).unwrap();
+        let Event::Connected(Ok(info)) = receive() else {
+            panic!("connect")
+        };
+        assert_eq!(info.port_states.len(), 2);
+        let mut config = info.port_states[0].config.clone();
+        config.role = PortRole::Slave;
+        jobs.send(Job::Control(ControlRequest::Configure {
+            port: 0,
+            config,
+            expected: Some(0),
+        }))
+        .unwrap();
+        assert!(
+            matches!(receive(), Event::Control { result: Ok(ControlReply::State(s)), .. }
+            if s.config_generation == 1 && s.config.role == PortRole::Slave)
+        );
+        let write = ControlRequest::TableWrite {
+            port: 0,
+            offset: 12,
+            data: vec![0x12, 0x34],
+            expected: Some(0),
+        };
+        jobs.send(Job::Control(write)).unwrap();
+        assert!(
+            matches!(receive(), Event::Control { result: Ok(ControlReply::Committed(c)), .. }
+            if c.generation == 1)
+        );
+        jobs.send(Job::Control(ControlRequest::TableWrite {
+            port: 0,
+            offset: 12,
+            data: vec![0xff, 0xff],
+            expected: Some(0),
+        }))
+        .unwrap();
+        assert!(
+            matches!(receive(), Event::Control { result: Err(e), connection_lost: false, .. }
+            if e.status == Some(ControlStatus::Conflict) && !e.result_unknown && !e.session_invalidated)
+        );
+        jobs.send(Job::Control(ControlRequest::TableRead {
+            port: 0,
+            offset: 12,
+            len: 2,
+        }))
+        .unwrap();
+        assert!(
+            matches!(receive(), Event::Control { result: Ok(ControlReply::Table(t)), .. }
+            if t.generation == 1 && t.data == [0x12, 0x34])
+        );
+        jobs.send(Job::Control(ControlRequest::FrontendGet(0)))
+            .unwrap();
+        assert!(
+            matches!(receive(), Event::Control { result: Err(e), connection_lost: false, .. }
+            if e.status == Some(ControlStatus::Unsupported) && !e.result_unknown)
+        );
+        jobs.send(Job::Disconnect).unwrap();
+        assert!(matches!(receive(), Event::Disconnected));
+    }
+
+    #[test]
+    fn scan_cancel_flag_is_observed_without_a_queued_cancel_job() {
+        let mut device = Device::offline();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = ControlRequest::Scan {
+            port: 0,
+            cancel: cancel.clone(),
+        };
+        // The UI owns the same flag while the worker owns the request. It need
+        // not enqueue another job behind the scan it wants to cancel.
+        cancel.store(true, Ordering::Relaxed);
+        let ControlReply::Scan(result) = run_control(&mut device, &request).unwrap() else {
+            panic!("scan result")
+        };
+        assert!(result.cancelled && !result.complete && result.addresses.is_empty());
+        assert!(result.error.is_none() && device.is_usable());
+    }
+
+    #[test]
+    fn matched_write_error_keeps_unknown_outcome_warning_on_usable_session() {
+        let mut bridge = Some(());
+        let event = transfer_bridge(&mut bridge, write(), |_, _| {
+            (
+                Err(transfer_error_text(DeviceError {
+                    message: "I2C 0x50: Nack (hpm_stat 2004)".into(),
+                    session_invalidated: false,
+                    result_unknown: true,
+                    status: None,
+                    hpm_stat: Some(2004),
+                })),
+                true,
+            )
+        });
+        let Event::Transfer {
+            result: Err(message),
+            connection_lost: false,
+            ..
+        } = event
+        else {
+            panic!("matched write NACK must keep the session")
+        };
+        assert!(message.contains("写入结果未知"));
+        assert!(message.contains("读回确认"));
+        assert!(message.contains("未自动重试"));
+        assert!(message.contains("Nack"));
+        assert!(bridge.is_some());
     }
 }

@@ -1,10 +1,7 @@
-//! I2C workbench: 主机 and 从机 tabs.
-//! 主机 runs on the bridge's one I2C command (write, read, write-then-read,
-//! once or on a loop). Scan and bus recovery have no command: they insert
-//! rows marked 演示. 从机's sync buttons are shown switched off with a short
-//! hover; the 从机 table is edited in the window only.
+//! Capability-aware I2C workbench with explicit port controls and table snapshots.
 
 mod batch;
+mod control;
 mod master;
 pub mod parse;
 mod slave;
@@ -14,12 +11,15 @@ use std::time::Duration;
 use eframe::egui;
 
 use batch::Batch;
+use control::Controls;
 pub use master::Master;
 use slave::Slave;
+use usb_i2c::control::{ControlCapabilities, PortState};
+use usb_i2c::device::DeviceError;
 use usb_i2c::proto::Capabilities;
 
 use crate::widgets::{self, Tone};
-use crate::worker::{Op, Transfer};
+use crate::worker::{ControlReply, ControlRequest, Op, Transfer};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -41,6 +41,7 @@ pub struct I2c {
     pub master: Master,
     slave: Slave,
     pub batch: Batch,
+    controls: Controls,
 }
 
 impl Default for I2c {
@@ -50,6 +51,7 @@ impl Default for I2c {
             master: Master::default(),
             slave: Slave::default(),
             batch: Batch::default(),
+            controls: Controls::default(),
         }
     }
 }
@@ -58,18 +60,51 @@ impl I2c {
     pub fn set_connection(&mut self, caps: &Capabilities, offline: bool) {
         self.master.set_connection(caps, offline);
         self.batch.set_connection(caps, offline);
+        self.controls.set_connection(caps, offline);
+        self.slave.disconnected();
+    }
+
+    pub fn set_controls(&mut self, caps: &[ControlCapabilities], states: &[PortState]) {
+        self.controls.set_controls(caps, states);
+        self.sync_roles();
+    }
+
+    fn sync_roles(&mut self) {
+        for port in 0..2 {
+            let control = &self.controls.ports[usize::from(port)];
+            let role = control.confirmed.as_ref().map(|s| s.config.role);
+            self.master
+                .set_role(port, role, control.caps.supports_role_config);
+            self.batch
+                .set_role(port, role, control.caps.supports_role_config);
+        }
+    }
+
+    pub fn disconnected(&mut self) {
+        self.controls.disconnected();
+        self.slave.disconnected();
+        self.master.stop_loop("设备已断开，循环已停止");
+        self.batch.result.clear();
+        self.sync_roles();
+    }
+
+    pub fn on_control(
+        &mut self,
+        request: &ControlRequest,
+        result: &Result<ControlReply, DeviceError>,
+    ) -> (String, Tone) {
+        self.slave.on_control(request, result);
+        let message = self.controls.on_control(request, result);
+        self.sync_roles();
+        message
     }
 }
 
 pub enum Action {
     Transfer(Op),
     Batch(Vec<Transfer>),
+    Control(ControlRequest),
 }
-
-/// The slave editor is still a local draft (S3 integration is pending).
-pub const FIXED_PORT: &str = "从机页仅编辑本地草稿，尚未接入设备";
-/// Hover on a control that is switched off.
-pub const NO_CMD: &str = "当前固件无此命令";
 
 /// Returns the transfer the user asked for, if any.
 pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Action> {
@@ -80,7 +115,7 @@ pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Action> {
     };
     let subtitle = match st.tab {
         Tab::Master => "写入、读取、写后读，可按周期循环。端口、速率与长度按连接设备能力开放。",
-        Tab::Slave => "EEPROM 式寄存器表，256 字节、1 字节偏移，在本窗口编辑。",
+        Tab::Slave => "每端口独立的 256 B 从机表草稿，显式读回快照与 CAS 片段下发。",
         Tab::Batch => "一次提交 CH0/CH1 各一笔独立事务，分别显示结果。实际总线并发需波形验证。",
     };
     widgets::page_head(ui, "I2C", Some(badge), subtitle, |ui| {
@@ -105,13 +140,33 @@ pub fn page(ui: &mut egui::Ui, st: &mut I2c, cx: Ctx) -> Option<Action> {
     ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| match st.tab {
-            Tab::Master => master::show(ui, &mut st.master, cx).map(Action::Transfer),
-            Tab::Batch => st.batch.show(ui, cx).map(Action::Batch),
-            Tab::Slave => {
-                slave::show(ui, &mut st.slave);
-                None
+        .show(ui, |ui| {
+            let control_action = st.controls.show(ui, cx);
+            let port = st.controls.port;
+            st.master.select_port(port);
+            ui.add_space(12.0);
+            let page_action = match st.tab {
+                Tab::Master => master::show(ui, &mut st.master, cx).map(Action::Transfer),
+                Tab::Batch => st.batch.show(ui, cx).map(Action::Batch),
+                Tab::Slave => {
+                    let control = &st.controls.ports[usize::from(port)];
+                    slave::show(
+                        ui,
+                        &mut st.slave,
+                        port,
+                        &control.caps,
+                        control.confirmed.as_ref(),
+                        cx,
+                    )
+                    .map(Action::Control)
+                }
+            };
+            st.master.select_port(port);
+            let action = control_action.map(Action::Control).or(page_action);
+            if matches!(action, Some(Action::Control(_))) {
+                st.master.stop_loop("执行端口控制，循环已停止");
             }
+            action
         })
         .inner
 }
@@ -193,5 +248,107 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod control_ui_tests {
+    use super::*;
+    use usb_i2c::control::{PortConfig, PortRole};
+    use usb_i2c::device::Device;
+
+    #[test]
+    fn connected_controls_keep_all_tabs_within_900px_and_never_send_on_render() {
+        for dark in [false, true] {
+            for tab in [Tab::Master, Tab::Slave, Tab::Batch] {
+                let mut device = Device::offline();
+                device
+                    .configure_port(
+                        1,
+                        &PortConfig {
+                            role: PortRole::Slave,
+                            ..PortConfig::default()
+                        },
+                        None,
+                    )
+                    .unwrap();
+                let states = [device.port_state(0).unwrap(), device.port_state(1).unwrap()];
+                let mut workbench = I2c::default();
+                workbench.set_connection(device.capabilities(), true);
+                workbench.set_controls(device.control_capabilities(), &states);
+                workbench.tab = tab;
+                if tab == Tab::Slave {
+                    workbench.controls.port = 1;
+                }
+                let ctx = egui::Context::default();
+                crate::theme::install(&ctx);
+                crate::fonts::install(&ctx);
+                ctx.set_theme(if dark {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                });
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::Panel::left("control_test_nav")
+                            .exact_size(crate::nav::WIDTH)
+                            .show(ui, |_| {});
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 16)))
+                            .show(ui, |ui| {
+                                widgets::page_width(ui, |ui| {
+                                    let right = ui.max_rect().right();
+                                    assert!(page(
+                                        ui,
+                                        &mut workbench,
+                                        Ctx {
+                                            connected: true,
+                                            busy: false,
+                                            now: Duration::ZERO
+                                        }
+                                    )
+                                    .is_none());
+                                    assert!(
+                                        ui.min_rect().right() <= right + 0.5,
+                                        "controls overflow at dark={dark}: {:?} > {right}",
+                                        ui.min_rect()
+                                    );
+                                });
+                            });
+                    },
+                );
+                output.textures_delta.clear();
+                for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+                    assert!(primitive.clip_rect.is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_clears_confirmed_roles_stops_loops_and_reconnect_selects_ch0() {
+        let mut device = Device::offline();
+        let states = [device.port_state(0).unwrap(), device.port_state(1).unwrap()];
+        let mut workbench = I2c::default();
+        workbench.set_connection(device.capabilities(), true);
+        workbench.set_controls(device.control_capabilities(), &states);
+        workbench.controls.port = 1;
+        workbench.master.arm_test_write_loop();
+        workbench.disconnected();
+        assert!(!workbench.master.looping());
+        assert!(workbench
+            .controls
+            .ports
+            .iter()
+            .all(|p| p.confirmed.is_none()));
+        workbench.set_connection(device.capabilities(), true);
+        assert_eq!(workbench.controls.port, 0);
     }
 }
