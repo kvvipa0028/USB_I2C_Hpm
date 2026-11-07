@@ -1,0 +1,38 @@
+name: Host checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update
+      - name: Install Clippy
+        run: rustup component add clippy --toolchain stable
+      - name: Test host behavior and headless UI
+        run: cargo +stable test --workspace --all-targets --locked
+      - name: Check bridge and GUI
+        run: cargo +stable clippy -p usb-i2c -p usb-i2c-gui --all-targets --locked -- -D warnings
+      - name: Build host release binaries
+        run: cargo +stable build --workspace --release --locked
+      - name: Test CLI report adapter
+        run: python -m unittest discover -s ../tools/hil -p "test_*.py"
+      - name: Check offline CLI contract
+        run: python ../tools/hil/run.py --mode offline --cli target/release/usb-i2c${{ runner.os == 'Windows' && '.exe' || '' }} --report target/p0-offline.json
+
+# No hardware claim: this job has no EVK, USB fixture, oscilloscope or HPM SDK.

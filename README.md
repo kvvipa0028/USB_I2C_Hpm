@@ -1,6 +1,6 @@
 # USB 转 I2C 接口设备
 
-面向 HPM6360（开发板 HPM6300EVK）的 USB 转 I2C 原型：固件在 `firmware/`，电脑端是 Rust workspace（`host/`）。当前线上协议只有 `CMD_PING` 与 `CMD_I2C`；图形界面里除设备连接和 I2C 主机传输外，其余页面都在本窗口演示。
+面向 HPM6360（开发板 HPM6300EVK）的 USB 转 I2C 原型：固件在 `firmware/`，电脑端是 Rust workspace（`host/`）。当前固件只有 `CMD_PING` 与 `CMD_I2C`。PC 端已加入能力查询、显式端口/速率与双端口批次协议，以及明确标记的离线模型；扩展固件和实际时序仍待实现/上板。其余总线页面仍为本地演示。
 
 *Prototype USB-to-I2C bridge for the HPM6360 on the HPM6300EVK. The on-wire protocol is PING and I2C master transfers only.*
 
@@ -11,8 +11,8 @@
 | 项目 | 现状 | 依据 |
 | --- | --- | --- |
 | USB 桥固件 `firmware/usb_i2c` | 原型。快乐路径有一次台上记录；电脑端恢复路径**待上板** | 只做 I2C0 主机、100 kHz。提交 `ac4e73e` 的说明记载：EVK 桥与 EVKMini 寄存器表从机做过 PING、写、重复 START 读、缺席地址 NACK。仓库无该次原始日志。其后 GUI（PR #1、#2）与单桥恢复（PR #3）未再上板 |
-| 电脑端库与 CLI `usb-i2c` | 代码已有。会话失效与重连行为**待上板** | `list` / `ping` / `write` / `read` / `wr`。超时或损坏回复使会话失效，不自动重试 |
-| GUI `usb-i2c-gui` | 界面已合入（BusStudio 全模块页）。实机连接与 I2C **待上板** | 设备连接发 `CMD_PING`；I2C 主机的写入、读取、写后读（及同一笔循环）发 `CMD_I2C` |
+| 电脑端库与 CLI `usb-i2c` | 代码已有。会话失效与重连行为**待上板** | 兼容 `list` / `ping` / `write` / `read` / `wr`，新增 `info`、`batch`、`--json`、`--offline`。能力按设备回复开放；超时或损坏回复使会话失效，不自动重试 |
+| GUI `usb-i2c-gui` | 界面已合入（BusStudio 全模块页）。实机连接与 I2C **待上板** | 连接查询能力；旧固件仅 CH0/100k。显式选择离线模型后可操作两路独立 EEPROM；端口/频率/批次与结果来源可见 |
 | I2C 扫描、总线恢复 | 本地演示 | 固件没有这些命令。按钮只往事务表插入标「演示」的示例行 |
 | I2C 从机寄存器表 | 仅本窗口编辑；设备同步未实现 | 可编辑 256 字节表，关闭窗口后不保留。「下发到设备」「从设备读回」按钮禁用，固件没有对应命令 |
 | 经典 CAN / CAN FD | 本地演示 | 支持协议切换、BRS、数据段速率和帧长度校验；接收生成示例帧，发送只追加 TX 记录，不发 USB |
@@ -21,7 +21,7 @@
 | 硬件 I2C 主机自测 `firmware/i2c_proto`（T1.8） | 已上板（无单独日志） | 独立固件，对端是 SDK 从机示例。通过读数写在 [AGENTS.md](AGENTS.md)：`c0ffee18`、写/读成功、0 处不一致、缺席地址为 `status_i2c_no_addr_hit`（2003） |
 | 从机寄存器表 `firmware/slave_proto`（T1.9） | 100 kHz 直连通过；400 kHz **未通过，待重测** | 独立固件，不经 USB。400 kHz 曾在接 10 kΩ 上拉、接线异常期间测试失败，正确接线下尚未重测。记录见 [docs/T1.9-slave-test.md](docs/T1.9-slave-test.md) |
 | USB 批量吞吐 `firmware/usb_speed` 与 `usb-speed` | 工具已有；本仓库无实测报告，**待上板** | 与 I2C 桥不同固件。两边都使用测试号 VID:PID `1209:0001`，产品字符串分别为 `usb_speed` 和 `usb_i2c` |
-| 双端口与角色切换、可调速率、地址扫描与总线恢复命令、上拉与 1.8–5 V、C / Python SDK、固件升级与防克隆 | 规划 | 见 [PRD.md](PRD.md)、[DEV_PLAN.md](DEV_PLAN.md)。仓库里还没有 `docs/usb-protocol.md`、`host/crates/sdk-c`、`sdk-py`、bootloader 或硬件目录 |
+| 双端口与角色切换、可调速率、地址扫描与总线恢复命令、上拉与 1.8–5 V、C / Python SDK、固件升级与防克隆 | 规划 | 见 [PRD.md](PRD.md)、[DEV_PLAN.md](DEV_PLAN.md)。PC 协议合同见 [usb-protocol.md](docs/usb-protocol.md)；双端口固件、`host/crates/sdk-c`、`sdk-py`、bootloader 和产品硬件仍未实现 |
 
 「待上板」表示仓库里有对应代码或电脑端测试，但没有实体 HPM6300EVK 上的验收记录。PR #3 的单桥恢复、EEPROM 容量边界和 AD 演示计时只做过电脑端模型测试与界面测试，见 [docs/host-reliability.md](docs/host-reliability.md)。
 
@@ -95,6 +95,15 @@ macOS 上的构建产物同样是 `target/release/usb-i2c-gui` 可执行文件�
 ```
 
 这里的 `0x50` 是示例 7 位从机地址，长度 `16` 为十进制，数据字节按十六进制解析。写入示例按寄存器表从机的约定，以 `00` 为偏移；`wr 0x50 16 00` 表示先写偏移 `0x00`，再重复 START 读取 16 字节。实际使用时按目标器件协议调整地址和数据；`read` 是直接读，不先写寄存器地址。
+
+无 EVK 时，在 GUI「设备连接」页点击「连接离线测试设备」。CH0/CH1 各有独立的 `0x50`、256 B EEPROM 模型，首个写字节为偏移，表尾回绕；其他地址返回 NACK。主机页可以选择端口与 10k–1M Hz 请求参数，双端口批次页一次提交每端口各一笔事务。速率只做参数校验，模型不产生 USB/I2C 信号，也不模拟 IRQ、拉伸和波形并发；断开后模型数据重置。
+
+```sh
+./target/release/usb-i2c --offline --json info
+./target/release/usb-i2c --offline --port 1 --speed-hz 400000 wr 0x50 4 00
+```
+
+每次 CLI 调用都是新连接，离线内存不会跨进程保存。完整命令与机器可读验收入口见 [test-plan.md](docs/test-plan.md)。S1 三档固件构建及到板后的频率/连续传输验收见 [s1-bench-readiness.md](docs/s1-bench-readiness.md)；升级布局和安全设计边界见 [firmware-update-design.md](docs/firmware-update-design.md)。
 
 吞吐工具配合已烧录 `firmware/usb_speed` 的板子：
 

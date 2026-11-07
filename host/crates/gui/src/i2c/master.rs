@@ -1,5 +1,5 @@
-//! 主机 tab. Config on the left (port and rate are fixed by the firmware;
-//! address, register address, and read length are fields), then the
+//! 主机 tab. Capability-gated port and rate, address, register address,
+//! and read length, then the
 //! transaction, its result, and this session's transaction log.
 //!
 //! Real transfers use the bridge's one I2C command, once or on a loop
@@ -11,12 +11,12 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use eframe::egui;
-use usb_i2c::proto::MAX_XFER;
+use usb_i2c::proto::{Capabilities, MAX_XFER};
 
 use super::parse::{
     clock, hex_dump, parse_addr, parse_bytes, parse_len, preview, short_error, to_hex,
 };
-use super::{Ctx, FIXED_PORT, FIXED_RATE};
+use super::Ctx;
 use crate::local::{parse_hex, parse_num, Saved};
 use crate::theme;
 use crate::widgets::{self, Table, Tone};
@@ -30,6 +30,9 @@ const DEMO_SCAN: [u8; 3] = [0x48, 0x50, 0x68];
 const DEMO_HOVER: &str = "本地演示：插入示例行，不发 USB（当前固件无此命令）";
 
 pub struct Record {
+    port: u8,
+    speed_hz: u32,
+    offline: bool,
     id: u64,
     /// Since the window opened.
     at: Duration,
@@ -48,11 +51,20 @@ impl Record {
         if let Some(what) = self.demo {
             return format!("本地演示：{what} 0x{:02x}，未发 USB", self.addr);
         }
+        let prefix = format!(
+            "{} CH{} · ",
+            if self.offline { "离线" } else { "USB" },
+            self.port
+        );
         match &self.result {
             Ok(data) => match self.op {
-                Op::Write => format!("已写入 {} 字节到 0x{:02x}", self.wdata.len(), self.addr),
-                Op::Read => format!("读回 {} 字节", data.len()),
-                Op::WriteRead => format!("写后读回 {} 字节", data.len()),
+                Op::Write => format!(
+                    "{prefix}已写入 {} 字节到 0x{:02x}",
+                    self.wdata.len(),
+                    self.addr
+                ),
+                Op::Read => format!("{prefix}读回 {} 字节", data.len()),
+                Op::WriteRead => format!("{prefix}写后读回 {} 字节", data.len()),
             },
             Err(e) => e.clone(),
         }
@@ -66,6 +78,8 @@ impl Record {
 /// What 保存配置 keeps.
 #[derive(Clone, PartialEq, Debug)]
 struct Cfg {
+    port: u8,
+    speed_hz: String,
     addr: String,
     /// UI-only preference, not sent to the bridge until its protocol supports it.
     clock_stretching: bool,
@@ -79,6 +93,8 @@ struct Cfg {
 impl Default for Cfg {
     fn default() -> Self {
         Self {
+            port: 0,
+            speed_hz: "100000".into(),
             addr: "0x50".into(),
             clock_stretching: true,
             reg: String::new(),
@@ -109,6 +125,8 @@ impl Cfg {
 }
 
 pub struct Master {
+    capabilities: Capabilities,
+    offline: bool,
     cfg: Cfg,
     saved: Saved<Cfg>,
     advanced: bool,
@@ -131,6 +149,8 @@ pub struct Master {
 impl Default for Master {
     fn default() -> Self {
         Self {
+            capabilities: Capabilities::legacy(),
+            offline: false,
             cfg: Cfg::default(),
             saved: Saved::default(),
             advanced: false,
@@ -147,6 +167,17 @@ impl Default for Master {
 }
 
 impl Master {
+    pub fn set_connection(&mut self, capabilities: &Capabilities, offline: bool) {
+        self.stop_loop("连接操作，循环已停止");
+        self.capabilities = capabilities.clone();
+        self.offline = offline;
+        // Do not carry an unsupported draft over to a legacy connection.
+        self.cfg.port = 0;
+        self.cfg.speed_hz = capabilities.fixed_speed_hz.to_string();
+        // A saved CH1/custom-rate draft must not be restorable on a legacy device.
+        self.saved = Saved::default();
+    }
+
     /// Check the fields and build the transfer for `op`. A register
     /// address, if given, goes before the write bytes.
     pub fn transfer(&self, op: Op) -> Result<Transfer, String> {
@@ -170,7 +201,25 @@ impl Master {
         if wdata.len() > MAX_XFER {
             return Err(format!("寄存器地址加数据超过 {MAX_XFER} 字节"));
         }
+        let speed_hz = parse_num(
+            &self.cfg.speed_hz,
+            self.capabilities.min_speed_hz,
+            self.capabilities.max_speed_hz,
+            "SCL 频率",
+        )?;
+        if self.cfg.port >= self.capabilities.port_count {
+            return Err("所选端口不在设备能力范围内".into());
+        }
+        if wdata.len() > self.capabilities.max_transfer || rlen > self.capabilities.max_transfer {
+            return Err(format!(
+                "设备每次最多支持 {} 字节",
+                self.capabilities.max_transfer
+            ));
+        }
         Ok(Transfer {
+            port: self.cfg.port,
+            speed_hz,
+            offline: self.offline,
             op,
             addr,
             wdata,
@@ -191,6 +240,9 @@ impl Master {
         }
         self.push(Record {
             id: 0,
+            port: t.port,
+            speed_hz: t.speed_hz,
+            offline: t.offline,
             at,
             op: t.op,
             addr: t.addr,
@@ -217,6 +269,9 @@ impl Master {
         for (i, addr) in DEMO_SCAN.into_iter().enumerate() {
             self.push(Record {
                 id: 0,
+                port: self.cfg.port,
+                speed_hz: 100_000,
+                offline: self.offline,
                 at: at + Duration::from_millis(i as u64),
                 op: Op::Write,
                 addr,
@@ -232,6 +287,9 @@ impl Master {
     fn demo_recover(&mut self, at: Duration) {
         self.push(Record {
             id: 0,
+            port: self.cfg.port,
+            speed_hz: 100_000,
+            offline: self.offline,
             at,
             op: Op::Write,
             addr: 0,
@@ -306,34 +364,66 @@ pub fn save_button(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
 }
 
 pub fn show(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
-    widgets::work_columns(ui, m, 264.0, 760.0, config, |ui, m| {
-        summary(ui, m);
-        ui.add_space(12.0);
-        let op = compose(ui, m, cx);
-        ui.add_space(14.0);
-        result(ui, m);
-        ui.add_space(14.0);
-        log(ui, m, cx.now);
-        op
-    })
+    widgets::work_columns(
+        ui,
+        m,
+        264.0,
+        760.0,
+        |ui, m| config(ui, m, cx),
+        |ui, m| {
+            summary(ui, m);
+            ui.add_space(12.0);
+            let op = compose(ui, m, cx);
+            ui.add_space(14.0);
+            result(ui, m);
+            ui.add_space(14.0);
+            log(ui, m, cx.now);
+            op
+        },
+    )
 }
 
-fn config(ui: &mut egui::Ui, m: &mut Master) {
+fn config(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) {
+    let before = m.cfg.clone();
+    let port_label = format!("CH{}", m.cfg.port);
     widgets::panel(
         ui,
         "接口配置",
         |ui| {
-            widgets::badge(ui, "I2C0", Tone::Neutral);
+            widgets::badge(ui, &port_label, Tone::Neutral);
         },
         |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let c = &mut m.cfg;
             widgets::field_row(ui, "端口", false, |ui| {
-                widgets::fixed_value(ui, "I2C0 · 主机", FIXED_PORT);
+                ui.add_enabled_ui(!cx.busy && !m.looping, |ui| {
+                    egui::ComboBox::from_id_salt("master_port")
+                        .selected_text(format!("CH{} · 主机", c.port))
+                        .show_ui(ui, |ui| {
+                            for port in 0..m.capabilities.port_count {
+                                ui.selectable_value(&mut c.port, port, format!("CH{port} · 主机"));
+                            }
+                        });
+                });
             });
             widgets::field_row(ui, "速率", false, |ui| {
-                widgets::fixed_value(ui, "100 kHz", FIXED_RATE);
+                ui.add_enabled_ui(
+                    !cx.busy && !m.looping && m.capabilities.supports_custom_speed,
+                    |ui| {
+                        widgets::unit_edit(ui, &mut c.speed_hz, "100000", "Hz");
+                    },
+                );
             });
+            widgets::note(
+                ui,
+                if m.offline {
+                    "离线模型：仅检查 10k–1M Hz 参数，不模拟实际速率。"
+                } else if !m.capabilities.supports_custom_speed {
+                    "设备仅支持固定速率；此处显示设备能力。"
+                } else {
+                    "频率随每笔请求发送，实际波形需上板测量。"
+                },
+            );
             widgets::field_row(ui, "时钟延展", false, |ui| {
                 widgets::check(ui, &mut c.clock_stretching, "启用");
                 widgets::badge(ui, "仅设置", Tone::Neutral);
@@ -372,13 +462,24 @@ fn config(ui: &mut egui::Ui, m: &mut Master) {
                     .err()
                     .filter(|_| !c.read_len.trim().is_empty()),
                 c.period().err(),
+                parse_num(
+                    &c.speed_hz,
+                    m.capabilities.min_speed_hz,
+                    m.capabilities.max_speed_hz,
+                    "SCL 频率",
+                )
+                .err(),
             ];
             for e in errs.into_iter().flatten() {
                 widgets::error(ui, &e);
             }
             m.saved.foot(ui, &mut m.cfg);
+            widgets::note(ui, "连接变化后，重新保存配置。");
         },
     );
+    if m.cfg != before {
+        m.stop_loop("配置已修改，循环已停止");
+    }
     ui.add_space(8.0);
     widgets::note(
         ui,
@@ -402,7 +503,11 @@ fn summary(ui: &mut egui::Ui, m: &Master) {
             ("应答成功", format!("{acked} / {total}")),
             ("接收字节", format!("{read} B")),
         ],
-        "本次会话 · 不含演示行",
+        if m.offline {
+            "当前连接：离线模型 · 记录保留来源标记"
+        } else {
+            "记录按 USB / 离线标记 · 不含演示行"
+        },
     );
 }
 
@@ -434,13 +539,16 @@ fn compose(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
                     ui.label(egui::RichText::new(text).size(11.5).color(color));
                 });
             });
-            ui.add(
+            let write_edit = ui.add(
                 egui::TextEdit::multiline(&mut m.write_hex)
                     .hint_text("00 11 22 33")
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(3),
             );
+            if write_edit.changed() {
+                m.stop_loop("写入数据已修改，循环已停止");
+            }
             widgets::muted(
                 ui,
                 "当前从机把第一个字节当作寄存器表偏移。写后读：写完不发 STOP，重复 START 后读取。",
@@ -487,7 +595,14 @@ fn compose(ui: &mut egui::Ui, m: &mut Master, cx: Ctx) -> Option<Op> {
             if let Some((o, _)) = m.loop_op {
                 ui.horizontal(|ui| {
                     widgets::badge(ui, &format!("循环中 · {}", o.label()), Tone::Green);
-                    widgets::muted(ui, "每次都是一笔真实 I2C 传输");
+                    widgets::muted(
+                        ui,
+                        if m.offline {
+                            "每次执行一笔离线模型事务"
+                        } else {
+                            "每次发送一笔 USB I2C 请求"
+                        },
+                    );
                 });
             } else if let Some(n) = &m.loop_note {
                 ui.label(egui::RichText::new(n).size(11.5).color(t.amber));
@@ -565,6 +680,20 @@ fn result(ui: &mut egui::Ui, m: &Master) {
                 .size(11.5)
                 .color(t.muted),
             );
+            widgets::muted(
+                ui,
+                &format!(
+                    "{} · CH{} · 请求 {} Hz{}",
+                    if r.offline { "离线模型" } else { "USB" },
+                    r.port,
+                    r.speed_hz,
+                    if r.offline {
+                        " · 未测量实际频率"
+                    } else {
+                        ""
+                    }
+                ),
+            );
             match &r.result {
                 Ok(data) if data.is_empty() => {
                     ui.label(r.summary());
@@ -600,7 +729,7 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
         },
         |ui| {
             ui.horizontal(|ui| {
-                widgets::muted(ui, "I2C0 · 时间 / HEX");
+                widgets::muted(ui, "CH0 / CH1 · 来源 / 时间 / HEX");
                 widgets::trailing(ui, 27.0, |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if widgets::quiet_button(ui, count > 0, "清空").clicked() {
@@ -639,7 +768,7 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
                 return;
             }
             let table = Table {
-                widths: &[84.0, 72.0, 50.0, 0.0, 0.0, 64.0],
+                widths: &[84.0, 120.0, 50.0, 0.0, 0.0, 64.0],
             };
             table.header(ui, &["时间", "操作", "地址", "写入", "读回", "结果"]);
             egui::ScrollArea::vertical()
@@ -687,7 +816,16 @@ fn log(ui: &mut egui::Ui, m: &mut Master, now: Duration) {
                                 };
                                 [
                                     (clock(r.at), t.muted, true),
-                                    (r.op.label().to_owned(), t.fg, false),
+                                    (
+                                        format!(
+                                            "{} CH{} {}",
+                                            if r.offline { "离线" } else { "USB" },
+                                            r.port,
+                                            r.op.label()
+                                        ),
+                                        t.fg,
+                                        false,
+                                    ),
                                     (format!("0x{:02x}", r.addr), t.fg, true),
                                     (write, t.fg2, true),
                                     (read, t.fg, true),
@@ -772,6 +910,9 @@ mod tests {
         let mut m = Master::default();
         for i in 0..(LOG_MAX + 5) {
             let t = Transfer {
+                port: 0,
+                speed_hz: 100_000,
+                offline: false,
                 op: Op::Read,
                 addr: 0x50,
                 wdata: Vec::new(),
@@ -785,6 +926,9 @@ mod tests {
         // an old pick never falls off the end: each new record takes the card
         m.selected = Some(m.log.back().unwrap().id);
         let t = Transfer {
+            port: 0,
+            speed_hz: 100_000,
+            offline: false,
             op: Op::Read,
             addr: 0x50,
             wdata: Vec::new(),
@@ -823,6 +967,9 @@ mod tests {
         assert_eq!(m.loop_due(ms(200), true, false), Some(Op::Read));
         // a failed transfer stops it
         let t = Transfer {
+            port: 0,
+            speed_hz: 100_000,
+            offline: false,
             op: Op::Read,
             addr: 0x50,
             wdata: Vec::new(),
@@ -858,5 +1005,35 @@ mod tests {
         m.record(Duration::ZERO, transfer, Err("I2C Nack".into()));
         assert!(!m.looping && !m.looping());
         assert_eq!(m.loop_note.as_deref(), Some("传输失败，循环已停止"));
+    }
+    #[test]
+    fn connection_capabilities_gate_port_rate_and_preserve_record_source() {
+        let mut m = Master::default();
+        let offline = usb_i2c::device::Device::offline();
+        m.set_connection(offline.capabilities(), true);
+        m.cfg.port = 1;
+        m.cfg.speed_hz = "1000000".into();
+        m.saved.save(&m.cfg, Duration::ZERO);
+        let saved_offline = m.cfg.clone();
+        assert!(!m.saved.dirty(&saved_offline));
+        let t = m.transfer(Op::Read).unwrap();
+        assert_eq!((t.port, t.speed_hz, t.offline), (1, 1_000_000, true));
+        let record = m.record(Duration::ZERO, t, Ok(vec![0; 16]));
+        assert!(record.summary().contains("离线 CH1"));
+        m.cfg.speed_hz = "1000001".into();
+        assert!(m.transfer(Op::Read).is_err());
+        m.set_connection(&Capabilities::legacy(), false);
+        assert!(
+            m.saved.dirty(&saved_offline),
+            "old connection snapshot must be cleared"
+        );
+        assert_eq!((m.cfg.port, m.cfg.speed_hz.as_str()), (0, "100000"));
+        assert!(!m.transfer(Op::Read).unwrap().offline);
+        assert!(m.shown().unwrap().summary().contains("离线 CH1"));
+        m.cfg.port = 1;
+        assert!(m.transfer(Op::Read).is_err());
+        m.cfg.port = 0;
+        m.cfg.speed_hz = "400000".into();
+        assert!(m.transfer(Op::Read).is_err());
     }
 }

@@ -17,10 +17,22 @@
 #include "hpm_iomux.h"
 
 #define M_I2C   BOARD_APP_I2C_BASE
-#define BUS_MODE  i2c_mode_normal   /* normal = 100k, fast = 400k */
+#ifndef BUS_MODE
+#define BUS_MODE  i2c_mode_normal   /* normal = 100k, fast = 400k, fast_plus = 1M */
+#endif
+#ifndef PEER_PULLUP
 #define PEER_PULLUP 0   /* 1: also enable this board's internal pull-ups on SCL/SDA */
+#endif
 #define SLV     0x50U
+#ifndef ROUNDS
 #define ROUNDS  200U
+#endif
+#if ROUNDS < 1 || ROUNDS > 65535
+#error "ROUNDS must be 1..65535 to preserve first_info's 16-bit round field"
+#endif
+#if PEER_PULLUP != 0 && PEER_PULLUP != 1
+#error "PEER_PULLUP must be 0 or 1"
+#endif
 #define SEQ_ONLY 0      /* 1: only write 0..254 at offset 0 once; 0: ROUNDS-round test */
 
 volatile struct {

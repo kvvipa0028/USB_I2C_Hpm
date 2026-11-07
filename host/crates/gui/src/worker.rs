@@ -1,12 +1,14 @@
 //! USB runs on one worker thread so the window never blocks: the window
 //! sends a `Job`, the worker answers with an `Event` and asks for a repaint.
-//! Only PING (on connect) and I2C go over the wire; the bridge protocol has
-//! no other commands.
+//! The same jobs use either an explicitly selected offline model or USB.
+//! Device capabilities gate port and speed selection; requests are never replayed.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
-use usb_i2c::bridge::{list_devices, Bridge, DeviceInfo};
+use usb_i2c::bridge::{list_devices, DeviceInfo};
+use usb_i2c::device::{BackendKind, Device};
+use usb_i2c::proto::{Capabilities, TransferOutcome, TransferRequest};
 
 pub const DISCONNECT_FIRST: &str = "已连接设备，先点断开";
 
@@ -27,26 +29,43 @@ impl Op {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transfer {
+    pub port: u8,
+    pub speed_hz: u32,
+    pub offline: bool,
     pub op: Op,
     pub addr: u8,
     pub wdata: Vec<u8>,
     pub rlen: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub firmware: String,
+    pub capabilities: Capabilities,
+    pub offline: bool,
+}
+
 pub enum Job {
     Refresh,
     Connect(String),
+    ConnectOffline,
     /// Host side only: drop the open interface. Nothing is sent to the device.
     Disconnect,
     Transfer(Transfer),
+    Batch(Vec<Transfer>),
 }
 
 pub enum Event {
     Devices(Result<Vec<DeviceInfo>, String>),
-    Connected(Result<String, String>),
+    Connected(Result<Connection, String>),
     Disconnected,
+    Batch {
+        transfers: Vec<Transfer>,
+        result: Result<Vec<TransferOutcome>, String>,
+        connection_lost: bool,
+    },
     Transfer {
         transfer: Transfer,
         result: Result<Vec<u8>, String>,
@@ -65,24 +84,59 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
 }
 
 fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
-    let mut bridge: Option<Bridge> = None;
+    let mut bridge: Option<Device> = None;
     while let Ok(job) = jobs.recv() {
         let event = match job {
             Job::Refresh => Event::Devices(list_devices().map_err(|e| e.to_string())),
             Job::Connect(serial) => connect_bridge(&mut bridge, &serial, |serial| {
-                Bridge::open_serial(Some(serial))
-                    .and_then(|mut b| {
-                        let line = b.ping_line()?;
-                        Ok((b, line))
-                    })
+                Device::open_usb(Some(serial))
                     .map_err(|e| e.to_string())
+                    .and_then(connection_info)
+            }),
+            Job::ConnectOffline => connect_bridge(&mut bridge, "offline", |_| {
+                connection_info(Device::offline()).map_err(|e| e.to_string())
             }),
             Job::Disconnect => {
                 bridge = None;
                 Event::Disconnected
             }
+            Job::Batch(transfers) => {
+                let (result, usable) = match bridge.as_mut() {
+                    Some(b) => {
+                        let requests: Vec<_> = transfers
+                            .iter()
+                            .map(|t| TransferRequest {
+                                port: t.port,
+                                addr: t.addr,
+                                wdata: t.wdata.clone(),
+                                rlen: t.rlen,
+                                speed_hz: t.speed_hz,
+                            })
+                            .collect();
+                        let result = b.batch(&requests).map_err(|e| e.to_string());
+                        (result, b.is_usable())
+                    }
+                    None => (Err("未连接，先点连接".into()), false),
+                };
+                if !usable {
+                    bridge = None;
+                }
+                Event::Batch {
+                    transfers,
+                    result,
+                    connection_lost: !usable,
+                }
+            }
             Job::Transfer(t) => transfer_bridge(&mut bridge, t, |b, t| {
-                let result = b.i2c(t.addr, &t.wdata, t.rlen).map_err(|e| e.to_string());
+                let result = b
+                    .i2c(&TransferRequest {
+                        port: t.port,
+                        addr: t.addr,
+                        wdata: t.wdata.clone(),
+                        rlen: t.rlen,
+                        speed_hz: t.speed_hz,
+                    })
+                    .map_err(|e| e.to_string());
                 (result, b.is_usable())
             }),
         };
@@ -93,13 +147,22 @@ fn run(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     }
 }
 
+fn connection_info(mut device: Device) -> Result<(Device, Connection), String> {
+    let info = Connection {
+        firmware: device.ping_line().map_err(|e| e.to_string())?,
+        capabilities: device.capabilities().clone(),
+        offline: device.backend() == BackendKind::Offline,
+    };
+    Ok((device, info))
+}
+
 /// Keep the lifecycle guard outside the opener so a rejected Connect cannot
 /// claim another interface or send even a PING. The callback allows headless
 /// tests of the same path the USB worker uses.
 fn connect_bridge<B>(
     bridge: &mut Option<B>,
     serial: &str,
-    open: impl FnOnce(&str) -> Result<(B, String), String>,
+    open: impl FnOnce(&str) -> Result<(B, Connection), String>,
 ) -> Event {
     if bridge.is_some() {
         return Event::Connected(Err(DISCONNECT_FIRST.into()));
@@ -155,8 +218,19 @@ mod tests {
 
     use super::*;
 
+    fn info(firmware: &str) -> Connection {
+        Connection {
+            firmware: firmware.into(),
+            capabilities: Capabilities::legacy(),
+            offline: false,
+        }
+    }
+
     fn write() -> Transfer {
         Transfer {
+            port: 0,
+            speed_hz: 100_000,
+            offline: false,
             op: Op::Write,
             addr: 0x50,
             wdata: vec![0, 0xaa],
@@ -171,7 +245,7 @@ mod tests {
             let opened = Cell::new(0);
             let event = connect_bridge(&mut bridge, serial, |serial| {
                 opened.set(opened.get() + 1);
-                Ok((serial.to_owned(), "new firmware".into()))
+                Ok((serial.to_owned(), info("new firmware")))
             });
             assert!(matches!(event, Event::Connected(Err(e)) if e == DISCONNECT_FIRST));
             assert_eq!(bridge.as_deref(), Some("A"));
@@ -185,9 +259,9 @@ mod tests {
         let opened = Cell::new(0);
         let event = connect_bridge(&mut bridge, "A", |serial| {
             opened.set(opened.get() + 1);
-            Ok((serial.to_owned(), "firmware A".into()))
+            Ok((serial.to_owned(), info("firmware A")))
         });
-        assert!(matches!(event, Event::Connected(Ok(line)) if line == "firmware A"));
+        assert!(matches!(event, Event::Connected(Ok(line)) if line.firmware == "firmware A"));
         assert_eq!(bridge.as_deref(), Some("A"));
         assert_eq!(opened.get(), 1);
     }
@@ -287,5 +361,55 @@ mod tests {
             ));
             assert_eq!(bridge, Some(2), "an explicit later request may proceed");
         }
+    }
+    #[test]
+    fn offline_worker_executes_independent_ports_and_partial_batch_without_usb() {
+        let (jobs, events) = spawn(egui::Context::default());
+        let receive = || {
+            events
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        };
+        jobs.send(Job::ConnectOffline).unwrap();
+        assert!(
+            matches!(receive(), Event::Connected(Ok(info)) if info.offline && info.capabilities.port_count == 2)
+        );
+        let mut t = write();
+        t.offline = true;
+        jobs.send(Job::Transfer(t.clone())).unwrap();
+        assert!(matches!(
+            receive(),
+            Event::Transfer {
+                result: Ok(_),
+                connection_lost: false,
+                ..
+            }
+        ));
+        t.op = Op::WriteRead;
+        t.wdata = vec![0];
+        t.rlen = 1;
+        t.port = 1;
+        jobs.send(Job::Transfer(t.clone())).unwrap();
+        assert!(matches!(receive(), Event::Transfer { result: Ok(d), .. } if d == vec![0]));
+        t.port = 0;
+        jobs.send(Job::Transfer(t.clone())).unwrap();
+        assert!(matches!(receive(), Event::Transfer { result: Ok(d), .. } if d == vec![0xaa]));
+        let mut absent = t.clone();
+        absent.port = 1;
+        absent.addr = 0x51;
+        jobs.send(Job::Batch(vec![t, absent])).unwrap();
+        match receive() {
+            Event::Batch {
+                result: Ok(outcomes),
+                connection_lost: false,
+                ..
+            } => {
+                assert_eq!(outcomes[0].data, [0xaa]);
+                assert_eq!(outcomes[1].status, usb_i2c::proto::Status::Nack);
+            }
+            _ => panic!("expected independent batch results"),
+        }
+        jobs.send(Job::Disconnect).unwrap();
+        assert!(matches!(receive(), Event::Disconnected));
     }
 }

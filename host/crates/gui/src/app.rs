@@ -89,12 +89,15 @@ impl App {
     }
 
     fn start(&mut self, job: Job) {
-        if matches!(job, Job::Connect(_) | Job::Disconnect) {
+        if matches!(
+            job,
+            Job::Connect(_) | Job::ConnectOffline | Job::Disconnect | Job::Batch(_)
+        ) {
             self.i2c.master.stop_loop("连接操作，循环已停止");
         }
         // Enforce the same single-session rule as the controls and worker.
         // A repeated Connect must not replace even the same physical bridge.
-        if matches!(job, Job::Connect(_)) && self.dev.conn.is_some() {
+        if matches!(job, Job::Connect(_) | Job::ConnectOffline) && self.dev.conn.is_some() {
             self.fail(worker::DISCONNECT_FIRST.into());
             return;
         }
@@ -105,13 +108,22 @@ impl App {
             self.status = match &job {
                 Job::Refresh => "正在刷新设备列表…".into(),
                 Job::Connect(serial) => format!("正在连接 {serial}…"),
+                Job::ConnectOffline => "正在连接离线模型…".into(),
                 Job::Disconnect => "正在断开…".into(),
-                Job::Transfer(t) => format!("正在{} 0x{:02x}…", t.op.label(), t.addr),
+                Job::Batch(_) => "正在执行 CH0/CH1 批次…".into(),
+                Job::Transfer(t) => format!("CH{} 正在{} 0x{:02x}…", t.port, t.op.label(), t.addr),
             };
         }
-        if let Job::Connect(serial) = &job {
-            self.connect_failed = false;
-            self.connecting = Some(serial.clone());
+        match &job {
+            Job::Connect(serial) => {
+                self.connect_failed = false;
+                self.connecting = Some(serial.clone());
+            }
+            Job::ConnectOffline => {
+                self.connect_failed = false;
+                self.connecting = Some("OFFLINE-MODEL".into());
+            }
+            _ => {}
         }
         if self.jobs.send(job).is_err() {
             self.busy = false;
@@ -129,6 +141,7 @@ impl App {
         match action {
             Action::Refresh => self.start(Job::Refresh),
             Action::Connect(serial) => self.start(Job::Connect(serial)),
+            Action::ConnectOffline => self.start(Job::ConnectOffline),
             Action::Disconnect => self.start(Job::Disconnect),
         }
     }
@@ -175,8 +188,14 @@ impl App {
                     return;
                 };
                 match result {
-                    Ok(firmware) => {
-                        self.dev.conn = Some(Conn { serial, firmware });
+                    Ok(info) => {
+                        self.i2c.set_connection(&info.capabilities, info.offline);
+                        self.dev.conn = Some(Conn {
+                            serial,
+                            firmware: info.firmware,
+                            capabilities: info.capabilities,
+                            offline: info.offline,
+                        });
                         self.tone = Tone::Green;
                         self.status = "已连接".into();
                     }
@@ -193,6 +212,72 @@ impl App {
                 self.connect_failed = false;
                 self.tone = Tone::Neutral;
                 self.status = "已断开".into();
+            }
+            Event::Batch {
+                transfers,
+                result,
+                connection_lost,
+            } => {
+                if connection_lost {
+                    self.dev.conn = None;
+                    self.connecting = None;
+                    self.connect_failed = true;
+                }
+                self.i2c.master.stop_loop("批次已完成，循环保持停止");
+                self.i2c.batch.result.clear();
+                match result {
+                    Ok(outcomes) => {
+                        let mut failed = false;
+                        for (transfer, outcome) in transfers.into_iter().zip(outcomes) {
+                            let result = if outcome.status == usb_i2c::proto::Status::Ok {
+                                Ok(outcome.data)
+                            } else {
+                                failed = true;
+                                Err(format!(
+                                    "CH{}: {:?} (hpm_stat {})",
+                                    outcome.port, outcome.status, outcome.hpm_stat
+                                ))
+                            };
+                            let data = result
+                                .as_ref()
+                                .ok()
+                                .map(|d| i2c::parse::to_hex(d))
+                                .unwrap_or_default();
+                            let record =
+                                self.i2c
+                                    .master
+                                    .record(self.opened.elapsed(), transfer, result);
+                            self.i2c
+                                .batch
+                                .result
+                                .push(format!("{} {}", record.summary(), data));
+                        }
+                        self.tone = if failed { Tone::Red } else { Tone::Green };
+                        self.status = if failed {
+                            "批次已返回：部分端口失败，未自动重试"
+                        } else {
+                            "双端口批次完成"
+                        }
+                        .into();
+                    }
+                    Err(e) => {
+                        let message =
+                            if connection_lost && transfers.iter().any(|t| !t.wdata.is_empty()) {
+                                format!("连接已失效，写入结果未知，未自动重试。{e}")
+                            } else {
+                                e
+                            };
+                        for transfer in transfers {
+                            self.i2c.master.record(
+                                self.opened.elapsed(),
+                                transfer,
+                                Err(message.clone()),
+                            );
+                        }
+                        self.i2c.batch.result.push(message.clone());
+                        self.fail(message);
+                    }
+                }
             }
             Event::Transfer {
                 transfer,
@@ -274,6 +359,15 @@ impl eframe::App for App {
             _ => link.text().to_owned(),
         };
         let mut right = footer_note(self.page).to_owned();
+        if matches!(self.page, Page::Device | Page::I2c) {
+            if let Some(c) = &self.dev.conn {
+                right = if c.offline {
+                    "离线模型 · 未发 USB · 时序未验证".into()
+                } else {
+                    format!("USB · {} 路 · 能力按设备报告", c.capabilities.port_count)
+                };
+            }
+        }
         if !live.is_empty() {
             let names: Vec<&str> = live.iter().map(|p| p.label()).collect();
             right = format!("{right} · 演示运行中：{}", names.join("、"));
@@ -371,15 +465,20 @@ impl eframe::App for App {
             .inner;
         match request {
             Some(Request::Device(a)) => self.act(a),
-            Some(Request::I2c(op)) => self.start_transfer(op),
-            None => {}
+            Some(Request::I2c(i2c::Action::Transfer(op))) => self.start_transfer(op),
+            Some(Request::I2c(i2c::Action::Batch(transfers)))
+                if !self.busy && self.dev.can_send() =>
+            {
+                self.start(Job::Batch(transfers));
+            }
+            None | Some(Request::I2c(i2c::Action::Batch(_))) => {}
         }
     }
 }
 
 enum Request {
     Device(Action),
-    I2c(Op),
+    I2c(i2c::Action),
 }
 
 /// The pages that run in the window only and never reach the worker.
@@ -421,7 +520,7 @@ impl Local {
 /// Right end of the footer: what the open page is wired to.
 fn footer_note(page: Page) -> &'static str {
     match page {
-        Page::Device | Page::I2c => "I2C0 · 100 kHz（固件固定）",
+        Page::Device | Page::I2c => "连接后按设备能力开放控制",
         Page::Spi => "SPI · 本地会话",
         Page::Pwm => "PWM / 捕获 · 本地演示，不发 USB",
         Page::Can => "CAN · 本地演示，未接线",
@@ -465,6 +564,14 @@ mod tests {
 
     use super::*;
 
+    fn connection(firmware: &str) -> worker::Connection {
+        worker::Connection {
+            firmware: firmware.into(),
+            capabilities: usb_i2c::proto::Capabilities::legacy(),
+            offline: false,
+        }
+    }
+
     fn device(serial: &str) -> DeviceInfo {
         DeviceInfo {
             serial: serial.into(),
@@ -481,6 +588,8 @@ mod tests {
         dev.conn = Some(Conn {
             serial: "A".into(),
             firmware: "firmware A".into(),
+            capabilities: usb_i2c::proto::Capabilities::legacy(),
+            offline: false,
         });
         let mut app = App {
             jobs,
@@ -516,7 +625,7 @@ mod tests {
     fn reconnect_a(app: &mut App, requests: &Receiver<Job>) {
         app.act(Action::Connect("A".into()));
         assert!(matches!(requests.try_recv(), Ok(Job::Connect(s)) if s == "A"));
-        app.on_event(Event::Connected(Ok("firmware A again".into())));
+        app.on_event(Event::Connected(Ok(connection("firmware A again"))));
         assert!(app.dev.can_send());
         assert_eq!(app.dev.conn.as_ref().unwrap().serial, "A");
         assert!(!app.i2c.master.looping());
@@ -576,7 +685,7 @@ mod tests {
         app.act(Action::Connect("A".into()));
         assert!(matches!(requests.try_recv(), Ok(Job::Connect(_))));
         app.i2c.master.arm_test_write_loop();
-        app.on_event(Event::Connected(Ok("firmware A".into())));
+        app.on_event(Event::Connected(Ok(connection("firmware A"))));
         assert!(!app.i2c.master.looping());
         poll_loop(&mut app);
         assert!(requests.try_recv().is_err());
@@ -585,7 +694,7 @@ mod tests {
     #[test]
     fn unsolicited_connected_event_does_not_replace_active_bridge() {
         let (mut app, _) = connected_app();
-        app.on_event(Event::Connected(Ok("other firmware".into())));
+        app.on_event(Event::Connected(Ok(connection("other firmware"))));
         let conn = app.dev.conn.as_ref().unwrap();
         assert_eq!(conn.serial, "A");
         assert_eq!(conn.firmware, "firmware A");
@@ -703,5 +812,43 @@ mod tests {
         assert!(app.dev.conn.is_none());
         assert!(!app.i2c.master.looping());
         assert_eq!(app.link(), Link::Failed);
+    }
+    #[test]
+    fn offline_connect_requires_release_and_receives_capabilities_without_enumeration() {
+        let (mut app, requests) = connected_app();
+        app.act(Action::ConnectOffline);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(app.dev.conn.as_ref().unwrap().serial, "A");
+        app.on_event(Event::Disconnected);
+        app.dev.set_list(Vec::new());
+        app.act(Action::ConnectOffline);
+        assert!(matches!(requests.try_recv(), Ok(Job::ConnectOffline)));
+        let device = usb_i2c::device::Device::offline();
+        app.on_event(Event::Connected(Ok(worker::Connection {
+            firmware: "offline model".into(),
+            capabilities: device.capabilities().clone(),
+            offline: true,
+        })));
+        assert!(app.dev.can_send());
+        app.start_transfer(Op::Read);
+        assert!(matches!(requests.try_recv(), Ok(Job::Transfer(t)) if t.offline));
+    }
+
+    #[test]
+    fn batch_transport_loss_stops_loop_marks_write_unknown_and_never_replays() {
+        let (mut app, requests) = connected_app();
+        let transfer = app.i2c.master.transfer(Op::Write).unwrap();
+        app.on_event(Event::Batch {
+            transfers: vec![transfer],
+            result: Err("USB timeout".into()),
+            connection_lost: true,
+        });
+        assert!(app.dev.conn.is_none());
+        assert!(!app.i2c.master.looping());
+        assert!(app.status.contains("写入结果未知"));
+        assert!(app.i2c.batch.result[0].contains("未自动重试"));
+        poll_loop(&mut app);
+        assert!(requests.try_recv().is_err());
+        reconnect_a(&mut app, &requests);
     }
 }
